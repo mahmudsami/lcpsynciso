@@ -1,24 +1,26 @@
 # lcpsynciso
 
-Cluster long transcript reads (PacBio HiFi, ONT) by shared LCP-syncmer seeds, then
+Cluster long transcript reads (PacBio HiFi or ONT) by shared LCP-syncmer seeds, then
 resolve the isoforms within each cluster and build a consensus sequence for each. One
 binary, pure Rust, no external tools.
 
 | Command | What it does |
 |---|---|
-| `predict` | Reads to clusters to isoforms in one run. The input is read once and kept 2-bit packed in memory. |
+| `predict` | Clusters the reads and resolves isoforms in a single run. The input file is read once and held in memory, 2-bit packed. |
 | `cluster` | Clustering only. |
-| `find-isoforms` | Isoforms for an existing cluster assignment. The reads file does not need to be sorted by cluster. |
+| `find-isoforms` | Isoforms for an existing cluster assignment. The reads file does not need to be sorted by cluster. Single-threaded. |
 
 ## Build
 
-Requires Rust 1.79 or newer.
+Requires Rust 1.80 or newer (the minimum for the locked `rayon`) and an x86_64 or aarch64
+target; no other architecture is configured.
 
 ```sh
 cargo build --release      # -> target/release/lcpsynciso
 ```
 
-The aligner dependency (block-aligner) uses AVX2 on x86_64 and NEON on aarch64.
+The aligner dependency, block-aligner, is built with AVX2 on x86_64 and NEON on aarch64.
+It does not check the CPU at run time, so on x86_64 the binary needs an AVX2-capable CPU.
 
 ## Usage
 
@@ -32,21 +34,28 @@ lcpsynciso find-isoforms --clusters cluster_out/assignments.tsv \
     --reads reads.fastq.gz -o isoform_out/
 ```
 
-Input is FASTA or FASTQ, plain, gzip or bgzf. Reads are compared on the forward strand
-only, so they should already be oriented (for example PacBio FLNC reads).
+Input is FASTA or FASTQ, plain or gzip/bgzf; compression is recognised by a `.gz` or
+`.bgz` file extension. Reads are compared on the forward strand only, so they should
+already be oriented (for example PacBio FLNC reads).
 
-Run `lcpsynciso <command> --help` for every option and its default. Note that the default
+`--threads` (default 0, meaning all cores) applies to `predict` and `cluster`. Run
+`lcpsynciso <command> --help` for every option and its default. Note that the default
 `--min-shared` differs: 3 for `predict`, 8 for `cluster`.
 
 ### Outputs
 
 `predict` and `find-isoforms` write, in the `-o` directory:
 
-| File | Columns |
+| File | Contents |
 |---|---|
-| `isoform_assignments.tsv` | read_name, cluster_id, isoform_id |
-| `isoform_summary.tsv` | cluster_id, isoform_id, n_reads, length |
-| `isoforms.fasta` | consensus sequence per isoform |
+| `isoform_assignments.tsv` | read_name, cluster_id, isoform_id (with a header row) |
+| `isoform_summary.tsv` | cluster_id, isoform_id, n_reads, length (with a header row) |
+| `isoforms.fasta` | consensus sequence per isoform; the longest member read with `--no-consensus` |
+
+Not every read is assigned. A read is left out of `isoform_assignments.tsv` if its group
+has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluster is
+outside `--min-size`/`--max-size`. On the HiFi SIRV test data at `--min-iso 5`, 2.3% of
+reads were left out.
 
 `cluster` writes `summary.tsv`, `cluster_size_hist.tsv`, and, with `--emit-assignments`,
 `assignments.tsv` (read_name, cluster_id).
@@ -54,23 +63,27 @@ Run `lcpsynciso <command> --help` for every option and its default. Note that th
 ## How it works
 
 **Clustering.** Seeds are LCP-syncmer block hashes from several levels. Only seeds found
-in a moderate number of reads are used. Reads are clustered greedily in file order: each
-read joins the cluster its seeds vote for most, weighted by seed level, or starts a new
-cluster.
+in between `--min-occ` and `--max-occ` reads are used. Reads are clustered greedily in file
+order: each seed already claimed by a cluster votes for it, weighted by the seed's level.
+A read joins the winning cluster if its total reaches `--min-shared`, and otherwise starts
+a new cluster.
 
 **Isoforms**, per cluster:
 
 1. **Group by structure.** The longest unassigned read is the backbone, and every other
-   read is tested against it. Minimizer anchors show where the two agree; the gaps
-   between anchors and the read ends beyond them are then aligned. A read is rejected if
-   the sequences diverge, a gap holds one long indel (an exon or retained intron), or
-   too little of the read is matched. Rejected reads seed later groups.
+   unassigned read is tested against it. Minimizer anchors show where the two agree.
+   Gaps between anchors longer than `--max-gap` are aligned, and so are the read ends
+   beyond the first and last anchor. A read is rejected if the sequences diverge, a gap
+   holds one long indel (such as an exon or retained intron), or too little of the read
+   is matched. Rejected reads seed later groups.
 2. **Split on a recurrent indel** (`--min-variant-frac`, off by default): isoforms that
    differ by a few bases, such as a shifted splice site, share the same indel position.
-3. **Split by read ends:** reads that share a start peak and an end peak form an isoform;
-   truncated reads join the isoform that contains them.
-4. **Consensus:** windows between minimizers shared by most reads, each filled with the
-   most frequent read substring. No multiple alignment is needed.
+3. **Split by read ends.** Reads that share a start peak and an end peak form an isoform
+   if there are at least `--min-iso` of them. Other reads join the best-supported isoform
+   that contains them, or are dropped. Groups smaller than `--min-iso` are dropped.
+4. **Consensus.** The longest read is cut into windows at minimizers shared by a majority
+   of the isoform's reads; each window takes the most frequent read substring. No
+   multiple alignment is needed.
 5. **Merge duplicates:** isoforms whose consensuses show they are the same transcript.
 
 ## Notes
@@ -87,6 +100,7 @@ cluster.
 ```
 src/
   main.rs         subcommand dispatch
+  lib.rs          library root
   pipeline/       predict
   cluster/        cluster, plus the seed counting and greedy clustering predict uses
   isoform/        isoform resolution and find-isoforms
