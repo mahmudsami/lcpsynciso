@@ -1,0 +1,367 @@
+//! The `predict` subcommand: reads -> clusters -> isoforms in one process.
+//!
+//! The input file is read exactly once. Every read is kept 2-bit packed in memory
+//! ([`SeqStore`]), so clustering hands sequences straight to isoform resolution. Three phases:
+//!
+//!   A. Read and pack every read, counting how many reads contain each seed.
+//!   B. Cluster the stored reads greedily, in file order ([`GreedyClusterer`]).
+//!   C. Resolve each cluster into isoforms ([`isoform::resolve_cluster`]), in parallel across
+//!      clusters, and write the output files.
+
+use std::cmp::Reverse;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
+
+use rayon::prelude::*;
+
+use crate::cluster::{
+    count_seeds, informative_seeds, merge_seed_counts, weighted_seeds, GreedyClusterer, SeedCounts,
+    SeedParams,
+};
+use crate::hashmap::{fmap, FastMap};
+use crate::io::SeqReader;
+use crate::isoform::{self, parse_flag, Cfg, OutputFiles, Read, Rendered, RESOLVE_HELP};
+use crate::seqstore::SeqStore;
+
+pub struct Config {
+    pub reads: String,
+    pub out_dir: String,
+    pub threads: usize,
+    pub batch: usize,
+    pub max_reads: usize,
+    // Clustering.
+    pub k: usize,
+    pub s: usize,
+    pub t: usize,
+    pub levels: usize,
+    pub min_occ: u32,
+    pub max_occ: u32,
+    pub min_shared: u32,
+    pub weights: Vec<u32>,
+    // Which clusters to resolve, by read count.
+    pub min_size: usize,
+    pub max_size: usize,
+    // Isoform resolution.
+    pub cfg: Cfg,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            reads: String::new(),
+            out_dir: "lcpsynciso_out".into(),
+            threads: 0,
+            batch: 500_000,
+            max_reads: usize::MAX,
+            k: 15,
+            s: 9,
+            t: usize::MAX,
+            levels: 3,
+            min_occ: 2,
+            max_occ: 100_000,
+            min_shared: 3,
+            weights: vec![1, 2, 5],
+            min_size: 1,
+            max_size: usize::MAX,
+            cfg: Cfg::default(),
+        }
+    }
+}
+
+pub fn parse_args(argv: &[String]) -> Config {
+    let mut a = Config::default();
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = argv[i].clone();
+        let mut next = || {
+            i += 1;
+            argv.get(i).cloned().unwrap_or_else(|| {
+                eprintln!("missing value for {arg}");
+                std::process::exit(2);
+            })
+        };
+        match arg.as_str() {
+            "-o" | "--out" => a.out_dir = next(),
+            "--threads" => a.threads = next().parse().unwrap(),
+            "--batch" => a.batch = next().parse().unwrap(),
+            "--max-reads" => a.max_reads = next().parse().unwrap(),
+            "--k" => a.k = next().parse().unwrap(),
+            "--s" => a.s = next().parse().unwrap(),
+            "--t" => a.t = next().parse().unwrap(),
+            "--levels" => a.levels = next().parse().unwrap(),
+            "--min-occ" => a.min_occ = next().parse().unwrap(),
+            "--max-occ" => a.max_occ = next().parse().unwrap(),
+            "--min-shared" => a.min_shared = next().parse().unwrap(),
+            "--level-weights" => {
+                a.weights = next().split(',').map(|x| x.trim().parse().unwrap()).collect()
+            }
+            "--min-size" => a.min_size = next().parse().unwrap(),
+            "--max-size" => a.max_size = next().parse().unwrap(),
+            "--iso-k" => a.cfg.k = next().parse().unwrap(),
+            "--iso-w" => a.cfg.w = next().parse().unwrap(),
+            "--no-consensus" => a.cfg.consensus = false,
+            "-h" | "--help" => {
+                usage();
+                std::process::exit(0);
+            }
+            other => {
+                if !parse_flag(&mut a.cfg, other, &mut next) {
+                    if other.starts_with('-') {
+                        eprintln!("unknown flag {other}");
+                        std::process::exit(2);
+                    }
+                    a.reads = other.into();
+                }
+            }
+        }
+        i += 1;
+    }
+    if a.reads.is_empty() {
+        usage();
+        std::process::exit(2);
+    }
+    if a.t == usize::MAX {
+        a.t = (a.k - a.s) / 2;
+    }
+    a
+}
+
+pub fn usage() {
+    eprintln!(
+        "lcpsynciso predict — fused reads-to-isoforms pipeline (file read once, all in RAM)
+
+USAGE:
+    lcpsynciso predict <reads.fq[.gz]|.fa[.gz|.bgz]> [options]
+
+GENERAL:
+    -o, --out DIR           output directory                             [lcpsynciso_out]
+    --threads N             worker threads (0 = all)                     [0]
+    --batch N               reads per batch                              [500000]
+    --max-reads N           stop after N reads                           [all]
+
+CLUSTERING (seeds):
+    --k N / --s N           k-mer / s-mer length                         [15 / 9]
+    --t N                   open-syncmer offset of the minimal s-mer     [(k-s)/2]
+    --levels N              use seeds from levels L1..N                  [3]
+    --min-occ N             keep seed if it occurs in >= N reads         [2]
+    --max-occ N             ... and in <= N reads                        [100000]
+    --level-weights a,b,c   per-level vote weights                       [1,2,5]
+    --min-shared N          join a cluster if weighted shared >= N       [3]
+
+ISOFORMS:
+    --min-size N            skip clusters with fewer reads               [1]
+    --max-size N            skip clusters with more reads                [all]
+    --iso-k N / --iso-w N   isoform minimizer k-mer length / window      [15 / 10]
+    --no-consensus          write each isoform's longest read instead of a consensus
+
+{RESOLVE_HELP}
+
+OUTPUT (in DIR):
+    isoform_assignments.tsv   read_name <tab> cluster_id <tab> isoform_id
+    isoform_summary.tsv       cluster_id <tab> isoform_id <tab> n_reads <tab> length
+    isoforms.fasta            refined consensus per isoform"
+    );
+}
+
+/// Clusters resolved per parallel chunk; bounds how many rendered clusters wait in memory.
+const CHUNK: usize = 4000;
+
+pub fn run(a: Config) {
+    if a.threads > 0 {
+        rayon::ThreadPoolBuilder::new().num_threads(a.threads).build_global().ok();
+    }
+    let params = SeedParams { k: a.k, s: a.s, t: a.t, levels: a.levels };
+    let t_start = Instant::now();
+
+    // ── Phase A: read, pack, count seeds ──
+    eprintln!("[predict] phase A: reading {} once (pack + seed frequencies) ...", a.reads);
+    let (store, counts, [d_read, d_seed, d_pack]) = load_reads(&a, params);
+    let n = store.len();
+    let total_distinct = counts.len();
+    let informative = informative_seeds(&counts, a.min_occ, a.max_occ);
+    drop(counts);
+    let t_a = t_start.elapsed();
+    eprintln!(
+        "[predict] {} reads, distinct seeds={}, informative={}",
+        n,
+        total_distinct,
+        informative.len()
+    );
+    eprintln!(
+        "[predict] === phase A took {:.1}s  [read/decompress={:.1}s  seed-freq={:.1}s  2bit-pack={:.1}s] ===",
+        t_a.as_secs_f64(),
+        d_read.as_secs_f64(),
+        d_seed.as_secs_f64(),
+        d_pack.as_secs_f64()
+    );
+
+    // ── Phase B: cluster ──
+    let t_b0 = Instant::now();
+    eprintln!("[predict] phase B: greedy clustering (min-shared={}) ...", a.min_shared);
+    let members = cluster_reads(&a, params, &store, informative);
+    let n_clusters = members.len();
+    let t_b = t_b0.elapsed();
+    eprintln!("[predict] === phase B (clustering) took {:.1}s ===", t_b.as_secs_f64());
+
+    // ── Phase C: resolve isoforms ──
+    let t_c0 = Instant::now();
+    let mut targets: Vec<u32> = (0..n_clusters as u32)
+        .filter(|&c| {
+            let size = members[c as usize].len();
+            size >= a.min_size && size <= a.max_size
+        })
+        .collect();
+    targets.sort_unstable_by_key(|&c| Reverse(members[c as usize].len()));
+    eprintln!(
+        "[predict] phase C: resolving isoforms for {} clusters (parallel) ...",
+        targets.len()
+    );
+
+    let mut out = OutputFiles::create(&a.out_dir);
+    let (mut total_iso, mut n_resolved) = (0usize, 0usize);
+    let t_unpack = AtomicU64::new(0);
+    let t_render = AtomicU64::new(0);
+    for chunk in targets.chunks(CHUNK) {
+        let rendered: Vec<(Rendered, usize)> = chunk
+            .par_iter()
+            .map(|&cid| {
+                resolve_one(cid, &members[cid as usize], &store, &a.cfg, &t_unpack, &t_render)
+            })
+            .collect();
+        for (records, n_iso) in rendered {
+            out.append(&records);
+            total_iso += n_iso;
+            n_resolved += 1;
+        }
+    }
+    out.flush();
+    let t_c = t_c0.elapsed();
+
+    // ── Report ──
+    let (ns_maps, ns_split, ns_cons) = isoform::stats::timings_ns();
+    let secs = |ns: u64| ns as f64 / 1e9;
+    eprintln!(
+        "[predict] === phase C took {:.1}s wall  [aggregate CPU across threads: unpack={:.0}s  minimizer-maps={:.0}s  split={:.0}s  consensus={:.0}s  render={:.0}s] ===",
+        t_c.as_secs_f64(),
+        secs(t_unpack.load(Relaxed)),
+        secs(ns_maps),
+        secs(ns_split),
+        secs(ns_cons),
+        secs(t_render.load(Relaxed)),
+    );
+    isoform::stats::print_report();
+    eprintln!(
+        "[predict] done: {} reads -> {} clusters -> {} isoforms ({} clusters resolved). out: {}/",
+        n, n_clusters, total_iso, n_resolved, a.out_dir
+    );
+    eprintln!(
+        "[predict] TIMING  A(read+freq)={:.1}s  B(cluster)={:.1}s  C(isoforms)={:.1}s  total={:.1}s",
+        t_a.as_secs_f64(),
+        t_b.as_secs_f64(),
+        t_c.as_secs_f64(),
+        t_start.elapsed().as_secs_f64()
+    );
+}
+
+/// Phase A: pack every read into a [`SeqStore`] while counting seeds, a batch at a time.
+/// Also returns the time spent reading, counting, and packing.
+fn load_reads(a: &Config, params: SeedParams) -> (SeqStore, SeedCounts, [Duration; 3]) {
+    let mut store = SeqStore::default();
+    let mut counts: SeedCounts = fmap();
+    let (mut d_read, mut d_seed, mut d_pack) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut reader = SeqReader::open(&a.reads);
+    let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(a.batch);
+    loop {
+        batch.clear();
+        let remaining = a.max_reads.saturating_sub(store.len());
+        if remaining == 0 {
+            break;
+        }
+        let want = a.batch.min(remaining);
+        let t = Instant::now();
+        while batch.len() < want {
+            match reader.next() {
+                Some(record) => batch.push(record),
+                None => break,
+            }
+        }
+        d_read += t.elapsed();
+        if batch.is_empty() {
+            break;
+        }
+
+        let t = Instant::now();
+        let part = count_seeds(batch.par_iter().map(|(_, seq)| seq.as_slice()), params);
+        merge_seed_counts(&mut counts, part);
+        d_seed += t.elapsed();
+
+        let t = Instant::now();
+        for (name, seq) in batch.drain(..) {
+            store.push(name, &seq);
+        }
+        d_pack += t.elapsed();
+        eprintln!("[predict]   phase A {} reads ...", store.len());
+    }
+    (store, counts, [d_read, d_seed, d_pack])
+}
+
+/// Phase B: cluster the stored reads in file order and return each cluster's member read
+/// indices. Seeds are computed in parallel per batch; assignment is sequential.
+fn cluster_reads(
+    a: &Config,
+    params: SeedParams,
+    store: &SeqStore,
+    informative: FastMap<u8>,
+) -> Vec<Vec<u32>> {
+    let n = store.len();
+    let mut cluster_of: Vec<u32> = vec![0; n];
+    let mut clusterer = GreedyClusterer::new(a.min_shared);
+    let mut start = 0;
+    while start < n {
+        let end = (start + a.batch).min(n);
+        let seeds: Vec<Vec<(u64, u32)>> = (start..end)
+            .into_par_iter()
+            .map(|i| weighted_seeds(&store.get(i), params, &informative, &a.weights))
+            .collect();
+        for (offset, read_seeds) in seeds.iter().enumerate() {
+            cluster_of[start + offset] = clusterer.assign(read_seeds);
+        }
+        eprintln!("[predict]   phase B {} reads, {} clusters ...", end, clusterer.n_clusters());
+        start = end;
+    }
+    let n_clusters = clusterer.n_clusters();
+    // Free the seed tables before building the member lists.
+    drop(clusterer);
+    drop(informative);
+
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
+    for (i, &c) in cluster_of.iter().enumerate() {
+        members[c as usize].push(i as u32);
+    }
+    members
+}
+
+/// Phase C for one cluster, on a worker thread: unpack its reads, resolve its isoforms, and
+/// render its output records. Returns the records and the isoform count.
+fn resolve_one(
+    cid: u32,
+    member_ids: &[u32],
+    store: &SeqStore,
+    cfg: &Cfg,
+    t_unpack: &AtomicU64,
+    t_render: &AtomicU64,
+) -> (Rendered, usize) {
+    let t = Instant::now();
+    let reads: Vec<Read> = member_ids
+        .iter()
+        .map(|&i| Read { name: store.name(i as usize).to_string(), seq: store.get(i as usize) })
+        .collect();
+    t_unpack.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+
+    let isos = isoform::resolve_cluster(&reads, cfg);
+
+    let t = Instant::now();
+    let records = isoform::render(cid, &reads, &isos);
+    t_render.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    (records, isos.len())
+}

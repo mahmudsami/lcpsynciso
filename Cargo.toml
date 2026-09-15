@@ -1,0 +1,30 @@
+[package]
+name = "lcpsynciso"
+version = "0.1.0"
+edition = "2021"
+description = "Cluster long reads by shared LCP-syncmer seeds, then resolve isoforms within each cluster"
+
+[lib]
+name = "lcpsynciso"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lcpsynciso"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1"
+rayon  = "1"
+
+# SIMD feature is per-architecture: the SIF builds x86_64 (AVX2), local dev is
+# aarch64 (NEON). Pure Rust either way -- no C toolchain, so lcpsynciso.def is
+# unaffected.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+block-aligner = { version = "0.5", features = ["simd_avx2"] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+block-aligner = { version = "0.5", features = ["simd_neon"] }
+
+[profile.release]
+opt-level = 3
+lto = true
