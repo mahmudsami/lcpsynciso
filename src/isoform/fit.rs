@@ -21,8 +21,8 @@ use super::{anchors, ba, Cfg};
 ///
 /// `read_map` and `backbone_map` are the minimizer maps of the two sequences.
 pub(super) fn fits_interval(
-    read_map: &HashMap<u64, u32>,
-    backbone_map: &HashMap<u64, u32>,
+    read_map: &HashMap<u64, Vec<u32>>,
+    backbone_map: &HashMap<u64, Vec<u32>>,
     read: &[u8],
     backbone: &[u8],
     cfg: &Cfg,
@@ -30,15 +30,24 @@ pub(super) fn fits_interval(
     stats::inc(&stats::N_CALLS);
 
     // ── Anchors ──
+    // Every shared minimizer code pairs each of its read positions with each of its backbone
+    // positions; a code unique to both sequences (the common case) contributes exactly one.
     let t_anchor = Instant::now();
-    let mut anchors: Vec<(u32, u32)> =
-        read_map.iter().filter_map(|(c, &i)| backbone_map.get(c).map(|&j| (i, j))).collect();
+    let mut anchors: Vec<(u32, u32)> = Vec::new();
+    for (c, is) in read_map.iter() {
+        if let Some(js) = backbone_map.get(c) {
+            for &i in is {
+                for &j in js {
+                    anchors.push((i, j));
+                }
+            }
+        }
+    }
     if anchors.len() < cfg.min_anchors {
         stats::add_elapsed(&stats::T_ANCHOR, t_anchor);
         return reject(Reject::FewAnchors);
     }
-    anchors.sort_unstable(); // by read position
-    let chain = anchors::chain_anchors(&anchors);
+    let chain = anchors::chain_anchors(&mut anchors);
     stats::add_elapsed(&stats::T_ANCHOR, t_anchor);
     if chain.len() < cfg.min_anchors {
         return reject(Reject::ShortChain);

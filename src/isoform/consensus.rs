@@ -37,10 +37,15 @@ use super::Read;
 /// reusing minimizer maps already computed for the whole cluster (`maps[ri]`).
 /// Falls back to the backbone sequence for isoforms too small or too
 /// minimizer-poor to vote on.
+///
+/// A window boundary must be a single, unambiguous position in every read that votes on it,
+/// so this step only ever uses a minimizer where it occurs exactly once in a given read —
+/// `maps[ri]` may hold other positions for that same code (from a read elsewhere sharing the
+/// same minimizer more than once), but that read simply doesn't vote on this boundary.
 pub fn refine_consensus_with_maps(
     reads: &[Read],
     members: &[usize],
-    maps: &[HashMap<u64, u32>],
+    maps: &[HashMap<u64, Vec<u32>>],
 ) -> Vec<u8> {
     // Backbone = longest member.
     let bb = *members.iter().max_by_key(|&&i| reads[i].seq.len()).unwrap();
@@ -58,13 +63,14 @@ pub fn refine_consensus_with_maps(
     }
     let thresh = (members.len() / 2 + 1) as u32; // strict majority
 
-    // Breakpoints = backbone minimizers shared by a majority, ordered by
-    // position. Positions are k-mer starts, all distinct (one code per
-    // position), so the sort is strictly increasing.
+    // Breakpoints = backbone minimizers unique in the backbone and shared by a majority,
+    // ordered by position. Positions are k-mer starts and, once restricted to codes unique
+    // in the backbone, all distinct, so the sort is strictly increasing.
     let mut breaks: Vec<(u32, u64)> = maps[bb]
         .iter()
+        .filter(|(_, p)| p.len() == 1)
         .filter(|(c, _)| freq[*c] >= thresh)
-        .map(|(&c, &p)| (p, c))
+        .map(|(&c, p)| (p[0], c))
         .collect();
     breaks.sort_unstable();
     if breaks.len() < 2 {
@@ -80,14 +86,15 @@ pub fn refine_consensus_with_maps(
         let seq = &reads[ri].seq;
         let rmap = &maps[ri];
         // Read position at each backbone breakpoint, kept as a strictly
-        // increasing (collinear) chain; non-matching or out-of-order -> None.
+        // increasing (collinear) chain; non-matching, ambiguous (the code occurs more than
+        // once in this read) or out-of-order -> None.
         let mut last = -1i64;
         let mut rpos: Vec<Option<u32>> = Vec::with_capacity(m);
         for &(_p, c) in &breaks {
             match rmap.get(&c) {
-                Some(&rp) if (rp as i64) > last => {
-                    rpos.push(Some(rp));
-                    last = rp as i64;
+                Some(ps) if ps.len() == 1 && (ps[0] as i64) > last => {
+                    rpos.push(Some(ps[0]));
+                    last = ps[0] as i64;
                 }
                 _ => rpos.push(None),
             }
