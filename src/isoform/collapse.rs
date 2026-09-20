@@ -26,7 +26,7 @@ pub(super) fn collapse(mut isos: Vec<Isoform>, cfg: &Cfg) -> Vec<Isoform> {
         return isos;
     }
     isos.sort_by_key(|iso| Reverse(iso.members.len()));
-    let maps: Vec<HashMap<u64, u32>> =
+    let maps: Vec<HashMap<u64, Vec<u32>>> =
         isos.iter().map(|iso| minimizer_map(&iso.consensus, cfg.k, cfg.w)).collect();
     let strict = Cfg { min_cov: cfg.min_cov.max(0.95), max_gap: cfg.collapse_gap, ..cfg.clone() };
 
@@ -67,8 +67,8 @@ pub(super) fn collapse(mut isos: Vec<Isoform>, cfg: &Cfg) -> Vec<Isoform> {
 fn should_merge(
     small: &Isoform,
     big: &Isoform,
-    small_map: &HashMap<u64, u32>,
-    big_map: &HashMap<u64, u32>,
+    small_map: &HashMap<u64, Vec<u32>>,
+    big_map: &HashMap<u64, Vec<u32>>,
     cfg: &Cfg,
     strict: &Cfg,
 ) -> bool {

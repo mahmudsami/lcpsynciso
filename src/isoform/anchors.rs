@@ -1,10 +1,14 @@
 //! Minimizer anchors between two sequences, and the collinear chain through them.
 //!
-//! An anchor is a minimizer that occurs once in each sequence, pairing a read position with
-//! a backbone position. The chain is the largest set of anchors whose positions increase
-//! together in both sequences.
+//! An anchor pairs a read position with a backbone position that share a minimizer code.
+//! Every occurrence of a minimizer is kept, not only codes unique to one sequence, so a
+//! minimizer repeated in a read or backbone can seed more than one candidate anchor; the
+//! chain step below is what discards the pairings that aren't part of a real collinear
+//! alignment. The chain is the largest set of anchors whose positions increase together in
+//! both sequences.
 
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 // ── Minimizers ───────────────────────────────────────────────────────────────
@@ -35,9 +39,10 @@ fn encode_kmers(seq: &[u8], k: usize) -> Vec<(u64, u32)> {
     out
 }
 
-/// Window-`w` minimizers of `seq`, as code -> position. A code that is the minimizer at more
-/// than one position is left out, so every anchor built from the map is unambiguous.
-pub(super) fn minimizer_map(seq: &[u8], k: usize, w: usize) -> HashMap<u64, u32> {
+/// Window-`w` minimizers of `seq`, as code -> every position where it is the window minimum
+/// (in increasing order). Most codes carry exactly one position; a code the window picks
+/// more than once (a repeated minimizer) carries all of them.
+pub(super) fn minimizer_map(seq: &[u8], k: usize, w: usize) -> HashMap<u64, Vec<u32>> {
     let kms = encode_kmers(seq, k);
     let mut picks: Vec<(u64, u32)> = Vec::new();
     if kms.len() < w.max(1) {
@@ -53,24 +58,40 @@ pub(super) fn minimizer_map(seq: &[u8], k: usize, w: usize) -> HashMap<u64, u32>
             }
         }
     }
-    // Position per code, or -1 once a code has been seen at a second position.
-    let mut seen: HashMap<u64, i64> = HashMap::with_capacity(picks.len());
+    let mut map: HashMap<u64, Vec<u32>> = HashMap::with_capacity(picks.len());
     for (code, pos) in picks {
-        seen.entry(code).and_modify(|v| *v = -1).or_insert(pos as i64);
+        if is_homopolymer(code, k) {
+            continue;
+        }
+        map.entry(code).or_default().push(pos);
     }
-    seen.into_iter().filter(|&(_, v)| v >= 0).map(|(c, v)| (c, v as u32)).collect()
+    map
+}
+
+/// Whether every base of `code`'s k-mer is the same, as in a polyA tail. Such a k-mer is the
+/// minimizer at every position of its run, so keeping all of them would pair each position of
+/// one run with each of the other's: a ladder of equally valid anchors that the chain follows
+/// to an arbitrary offset, putting the terminal anchor inside the tail instead of at the last
+/// real sequence.
+fn is_homopolymer(code: u64, k: usize) -> bool {
+    let base = code & 3;
+    (0..k).all(|i| (code >> (2 * i)) & 3 == base)
 }
 
 // ── Chaining ─────────────────────────────────────────────────────────────────
 
-/// The longest chain of `anchors` (sorted by read position) whose backbone positions strictly
-/// increase.
+/// The longest chain through `anchors` whose read and backbone positions both strictly
+/// increase together. Sorts `anchors` in place: by read position ascending, then by backbone
+/// position descending among ties, so that anchors sharing a read position — a minimizer
+/// repeated in the read — can contribute at most one to the chain (the standard ordering for
+/// a longest chain strictly increasing in two coordinates, as opposed to a plain LIS).
 ///
 /// Maximising the number of anchors keeps a mispaired anchor out of the chain, because
 /// keeping it would block every anchor it sits in front of. Most comparisons have no
 /// mispaired anchor, so the greedy scan runs first: when it keeps every anchor, the full set
 /// is already the longest chain.
-pub(super) fn chain_anchors(anchors: &[(u32, u32)]) -> Vec<(u32, u32)> {
+pub(super) fn chain_anchors(anchors: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    anchors.sort_unstable_by_key(|&(i, j)| (i, Reverse(j)));
     let chain = greedy_chain(anchors);
     if chain.len() == anchors.len() {
         return chain;
@@ -78,7 +99,8 @@ pub(super) fn chain_anchors(anchors: &[(u32, u32)]) -> Vec<(u32, u32)> {
     lis_chain(anchors)
 }
 
-/// Keep each anchor whose backbone position is above the last one kept.
+/// Keep each anchor whose backbone position is above the last one kept. Anchors that share a
+/// read position are sorted backbone-descending, so at most the first one seen can pass.
 fn greedy_chain(anchors: &[(u32, u32)]) -> Vec<(u32, u32)> {
     let mut chain: Vec<(u32, u32)> = Vec::with_capacity(anchors.len());
     for &(i, j) in anchors {
@@ -108,7 +130,10 @@ thread_local! {
 const NO_PREV: u32 = u32::MAX;
 
 /// Longest strictly increasing subsequence by backbone position, in O(n log n) (patience
-/// sorting with predecessor links).
+/// sorting with predecessor links). Relies on the ordering [`chain_anchors`] sorts into
+/// `anchors` (read position ascending, backbone position descending among ties): a chain
+/// strictly increasing in backbone position is then automatically strictly increasing in
+/// read position too, so anchors sharing a read or backbone position never both appear in it.
 fn lis_chain(anchors: &[(u32, u32)]) -> Vec<(u32, u32)> {
     if anchors.is_empty() {
         return Vec::new();
@@ -143,4 +168,64 @@ fn lis_chain(anchors: &[(u32, u32)]) -> Vec<(u32, u32)> {
         out.reverse();
         out
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimizer_map_keeps_every_occurrence_of_a_repeated_kmer() {
+        // "AAAC" (code 1) is the window minimum at both position 0 and position 10. The old
+        // unique-only filter dropped such a code entirely; every occurrence is kept now.
+        let map = minimizer_map(b"AAACTTTTTTAAACTTTTTT", 4, 2);
+        assert_eq!(map.get(&1u64).map(Vec::as_slice), Some(&[0u32, 10][..]));
+    }
+
+    #[test]
+    fn minimizer_map_excludes_homopolymers() {
+        // Every k-mer of a polyA run is the same code, one per position: a ladder of equally
+        // valid anchors that drags a chain to an arbitrary offset inside the tail.
+        let map = minimizer_map(b"AAAAAAAA", 3, 4);
+        assert!(map.is_empty(), "the all-A 3-mer must not be an anchor, got {map:?}");
+        // The polyT 4-mer in the sequence above is excluded for the same reason.
+        let map = minimizer_map(b"AAACTTTTTTAAACTTTTTT", 4, 2);
+        assert!(!map.contains_key(&255u64), "polyT must not be an anchor");
+    }
+
+    #[test]
+    fn chain_anchors_plain_lis_unchanged() {
+        // No repeated read or backbone position: behaves exactly like the old unique-only
+        // chain. (2, 5) is a mispaired anchor: keeping it would block every anchor after it,
+        // so the unique longest chain drops it instead.
+        let mut anchors = vec![(0, 10), (1, 20), (2, 5), (3, 30), (4, 40)];
+        let chain = chain_anchors(&mut anchors);
+        assert_eq!(chain, vec![(0, 10), (1, 20), (3, 30), (4, 40)]);
+    }
+
+    #[test]
+    fn chain_anchors_drops_extra_anchors_from_a_repeated_read_minimizer() {
+        // Read position 10 pairs with two backbone candidates (10 -> 100, 10 -> 200): a
+        // minimizer repeated in the backbone. At most one can survive collinear chaining.
+        let mut anchors = vec![(10, 100), (10, 200), (20, 300)];
+        let chain = chain_anchors(&mut anchors);
+        assert_eq!(chain.len(), 2);
+        // Every read position in the chain is distinct and both coordinates strictly
+        // increase.
+        assert!(chain.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        assert_eq!(chain.last(), Some(&(20, 300)));
+    }
+
+    #[test]
+    fn chain_anchors_handles_ties_on_both_sides() {
+        // A minimizer repeated in the read (i=30 vs two backbone hits) AND one repeated in
+        // the backbone (j=100 vs two read hits) in the same anchor set.
+        let mut anchors = vec![(10, 100), (30, 110), (30, 90), (50, 100)];
+        let chain = chain_anchors(&mut anchors);
+        assert_eq!(chain.len(), 2, "no length-3 collinear chain exists among these anchors");
+        assert!(
+            chain.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1),
+            "chain must strictly increase in both coordinates: {chain:?}"
+        );
+    }
 }
