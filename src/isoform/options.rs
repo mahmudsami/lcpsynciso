@@ -90,7 +90,7 @@ impl Default for Cfg {
             max_flank: 25,
             polya_clamp: true,
             min_variant_frac: 0.0,
-            start_split: StartSplit::On,
+            start_split: StartSplit::Auto,
             end_modes: true,
             peak_width: 10,
             boundary_tol: 150,
@@ -168,7 +168,7 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
 
 READ ENDS (a structure group splits into isoforms by where its reads start and end):
     --start-split on|off|auto
-                            how read starts split a group: on = every    [on]
+                            how read starts split a group: on = every    [auto]
                             start peak; off = only 3' ends split, and a read
                             reaching further 5' than an isoform joins it;
                             auto = off, plus a downstream start that looks like

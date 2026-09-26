@@ -92,11 +92,11 @@ first.
    if there are at least `--min-iso` of them. Other reads join the best-supported isoform
    that contains them, or are dropped. Groups smaller than `--min-iso` are dropped.
    `--start-split` sets how starts count. In cDNA most reads are 5'-truncated, so start
-   peaks mostly mark truncation, and splitting by every one (`on`, the default) makes the
-   truncated majority an isoform of its own and drops the few full-length reads. With `off`
-   only 3' end peaks split, and a read reaching further 5' than an isoform joins it. `auto`
-   is `off` plus: a downstream start peak that looks like a real transcription start keeps
-   its reads as an isoform of its own, beside the full-length one. In capped cDNA (template
+   peaks mostly mark truncation, and splitting by every one (`on`) makes the truncated
+   majority an isoform of its own and drops the few full-length reads. With `off` only 3'
+   end peaks split, and a read reaching further 5' than an isoform joins it. `auto` (the
+   default) is `off` plus: a downstream start peak that looks like a real transcription
+   start keeps its reads as an isoform of its own, beside the full-length one. In capped cDNA (template
    switching) that means most of its reads carry an untemplated 5' G; without that signal
    (direct RNA, spike-ins), a sharp peak.
 4. **Consensus.** The longest read is cut into windows at minimizers carried by a majority

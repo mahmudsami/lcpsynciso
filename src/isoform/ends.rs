@@ -363,7 +363,8 @@ mod tests {
     fn start_split_drops_full_length_reads_of_a_truncated_majority() {
         // The truncated reads form a start peak, the full-length reads none; not contained
         // in the truncated isoform's extent, they are dropped.
-        assert_eq!(sizes(&truncated_majority(), &Cfg::default()), vec![8]);
+        let cfg = Cfg { start_split: StartSplit::On, ..Cfg::default() };
+        assert_eq!(sizes(&truncated_majority(), &cfg), vec![8]);
     }
 
     #[test]
