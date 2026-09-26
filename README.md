@@ -58,6 +58,10 @@ has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluste
 outside `--min-size`/`--max-size`. On the HiFi SIRV test data at `--min-iso 5`, 2.3% of
 reads were left out.
 
+With `--dump-clusters`, `predict` also writes `gene_clusters.tsv` (read_name, cluster_id,
+cluster_size, with a header row): the phase B cluster of every read, including the reads
+left out of `isoform_assignments.tsv`.
+
 `cluster` writes `summary.tsv`, `cluster_size_hist.tsv`, and, with `--emit-assignments`,
 `assignments.tsv` (read_name, cluster_id).
 
@@ -87,10 +91,22 @@ first.
 3. **Split by read ends.** Reads that share a start peak and an end peak form an isoform
    if there are at least `--min-iso` of them. Other reads join the best-supported isoform
    that contains them, or are dropped. Groups smaller than `--min-iso` are dropped.
-4. **Consensus.** The longest read is cut into windows at minimizers shared by a majority
-   of the isoform's reads; each window takes the most frequent read substring. No
-   multiple alignment is needed.
-5. **Merge duplicates:** isoforms whose consensuses show they are the same transcript.
+   `--start-split` sets how starts count. In cDNA most reads are 5'-truncated, so start
+   peaks mostly mark truncation, and splitting by every one (`on`, the default) makes the
+   truncated majority an isoform of its own and drops the few full-length reads. With `off`
+   only 3' end peaks split, and a read reaching further 5' than an isoform joins it. `auto`
+   is `off` plus: a downstream start peak that looks like a real transcription start keeps
+   its reads as an isoform of its own, beside the full-length one. In capped cDNA (template
+   switching) that means most of its reads carry an untemplated 5' G; without that signal
+   (direct RNA, spike-ins), a sharp peak.
+4. **Consensus.** The longest read is cut into windows at minimizers carried by a majority
+   of the reads covering that position (at least 2); each window takes the most frequent
+   read substring. Where fewer than 3 of the isoform's own reads cover a position, the other
+   reads of its structure group (same exons, other ends) vote too. No multiple alignment is
+   needed.
+5. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
+   the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
+   past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
 
 ## Notes
 

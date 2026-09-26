@@ -1,6 +1,18 @@
 //! Isoform-resolution settings: [`Cfg`], its defaults, and the command-line flags and help
 //! text that `predict` and `find-isoforms` share.
 
+/// How read starts split a structure group (`--start-split`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartSplit {
+    /// Every start peak splits, like every end peak.
+    On,
+    /// Only 3' ends split; a read reaching further 5' than an isoform joins it.
+    Off,
+    /// As `Off`, except that a downstream start peak that looks like a real transcription
+    /// start, not 5' truncation, becomes an isoform of its own (see `ends.rs`).
+    Auto,
+}
+
 /// Settings for [`super::resolve_cluster`], grouped by the step that reads them.
 #[derive(Clone)]
 pub struct Cfg {
@@ -35,6 +47,9 @@ pub struct Cfg {
     pub min_variant_frac: f64,
 
     // Step 3: split by read ends. (`ends.rs`)
+    /// Whether read starts split a group as well as read ends. In cDNA most reads are
+    /// 5'-truncated, so most start peaks mark truncation, not transcription start sites.
+    pub start_split: StartSplit,
     /// Group read ends by the peaks they form; false uses a fixed `boundary_tol` grid.
     pub end_modes: bool,
     /// Window (bp) used to find end peaks.
@@ -75,6 +90,7 @@ impl Default for Cfg {
             max_flank: 25,
             polya_clamp: true,
             min_variant_frac: 0.0,
+            start_split: StartSplit::On,
             end_modes: true,
             peak_width: 10,
             boundary_tol: 150,
@@ -102,6 +118,19 @@ pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> St
         "--polya-clamp" => cfg.polya_clamp = true,
         "--no-polya-clamp" => cfg.polya_clamp = false,
         "--min-variant-frac" => cfg.min_variant_frac = next().parse().unwrap(),
+        "--start-split" => {
+            cfg.start_split = match next().as_str() {
+                "on" => StartSplit::On,
+                "off" => StartSplit::Off,
+                "auto" => StartSplit::Auto,
+                other => {
+                    eprintln!("--start-split takes on, off or auto, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--split-starts" => cfg.start_split = StartSplit::On,
+        "--no-split-starts" => cfg.start_split = StartSplit::Off,
         "--end-modes" => cfg.end_modes = true,
         "--no-end-modes" => cfg.end_modes = false,
         "--peak-width" => cfg.peak_width = next().parse().unwrap(),
@@ -138,6 +167,15 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
                             the SAME >=2 bp indel at the SAME position; 0 = off
 
 READ ENDS (a structure group splits into isoforms by where its reads start and end):
+    --start-split on|off|auto
+                            how read starts split a group: on = every    [on]
+                            start peak; off = only 3' ends split, and a read
+                            reaching further 5' than an isoform joins it;
+                            auto = off, plus a downstream start that looks like
+                            a real transcription start (capped reads carry an
+                            untemplated 5' G; otherwise a sharp peak) becomes
+                            its own isoform. --split-starts / --no-split-starts
+                            are on / off
     --end-modes / --no-end-modes
                             group ends by the peaks they form, or on a   [peaks]
                             fixed --boundary-tol grid

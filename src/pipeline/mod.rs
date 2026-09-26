@@ -10,6 +10,8 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -44,6 +46,8 @@ pub struct Config {
     // Which clusters to resolve, by read count.
     pub min_size: usize,
     pub max_size: usize,
+    // Write each read's phase B cluster to `gene_clusters.tsv`.
+    pub dump_clusters: bool,
     // Isoform resolution.
     pub cfg: Cfg,
 }
@@ -67,6 +71,7 @@ impl Default for Config {
             weights: vec![1, 2, 5],
             min_size: 1,
             max_size: usize::MAX,
+            dump_clusters: false,
             cfg: Cfg::default(),
         }
     }
@@ -105,6 +110,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--iso-k" => a.cfg.k = next().parse().unwrap(),
             "--iso-w" => a.cfg.w = next().parse().unwrap(),
             "--no-consensus" => a.cfg.consensus = false,
+            "--dump-clusters" => a.dump_clusters = true,
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -143,6 +149,7 @@ GENERAL:
     --threads N             worker threads (0 = all)                     [0]
     --batch N               reads per batch                              [500000]
     --max-reads N           stop after N reads                           [all]
+    --dump-clusters         also write gene_clusters.tsv (phase B clusters)
 
 CLUSTERING (seeds):
     --k N / --s N           k-mer / s-mer length                         [15 / 9]
@@ -165,7 +172,8 @@ ISOFORMS:
 OUTPUT (in DIR):
     isoform_assignments.tsv   read_name <tab> cluster_id <tab> isoform_id
     isoform_summary.tsv       cluster_id <tab> isoform_id <tab> n_reads <tab> length
-    isoforms.fasta            refined consensus per isoform"
+    isoforms.fasta            refined consensus per isoform
+    gene_clusters.tsv         read_name <tab> cluster_id <tab> cluster_size (--dump-clusters)"
     );
 }
 
@@ -208,6 +216,9 @@ pub fn run(a: Config) {
     let n_clusters = members.len();
     let t_b = t_b0.elapsed();
     eprintln!("[predict] === phase B (clustering) took {:.1}s ===", t_b.as_secs_f64());
+    if a.dump_clusters {
+        write_clusters(&a.out_dir, &members, &store);
+    }
 
     // ── Phase C: resolve isoforms ──
     let t_c0 = Instant::now();
@@ -267,6 +278,20 @@ pub fn run(a: Config) {
         t_c.as_secs_f64(),
         t_start.elapsed().as_secs_f64()
     );
+}
+
+/// Write every read's phase B cluster, including reads that phase C later leaves out of
+/// `isoform_assignments.tsv`.
+fn write_clusters(dir: &str, members: &[Vec<u32>], store: &SeqStore) {
+    fs::create_dir_all(dir).expect("mkdir out");
+    let mut w = BufWriter::new(File::create(format!("{dir}/gene_clusters.tsv")).unwrap());
+    writeln!(w, "read_name\tcluster_id\tcluster_size").unwrap();
+    for (cid, reads) in members.iter().enumerate() {
+        for &ri in reads {
+            writeln!(w, "{}\t{cid}\t{}", store.name(ri as usize), reads.len()).unwrap();
+        }
+    }
+    w.flush().unwrap();
 }
 
 /// Phase A: pack every read into a [`SeqStore`] while counting seeds, a batch at a time.

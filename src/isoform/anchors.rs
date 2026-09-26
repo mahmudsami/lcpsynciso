@@ -23,6 +23,7 @@ pub(super) struct MinimizerMap {
 
 impl MinimizerMap {
     /// Positions of `code`, increasing; empty if the sequence lacks it.
+    #[cfg(test)]
     pub(super) fn get(&self, code: u64) -> &[u32] {
         let lo = self.codes.partition_point(|&c| c < code);
         let hi = lo + self.codes[lo..].partition_point(|&c| c == code);
