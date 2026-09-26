@@ -76,6 +76,7 @@ pub(super) fn collapse(
         out.push(Isoform {
             members: std::mem::take(&mut isos[k].members),
             consensus: std::mem::take(&mut isos[k].consensus),
+            alt_start: isos[k].alt_start,
         });
     }
     for i in 0..n {
@@ -88,7 +89,7 @@ pub(super) fn collapse(
         if rebuild[k] {
             let iso = &mut out[p];
             iso.consensus = if cfg.consensus {
-                consensus::refine_consensus_with_maps(reads, &iso.members, read_maps)
+                consensus::refine_consensus_with_maps(reads, &iso.members, &iso.members, read_maps)
             } else {
                 let longest = *iso.members.iter().max_by_key(|&&r| reads[r].seq.len()).unwrap();
                 reads[longest].seq.clone()
@@ -124,7 +125,10 @@ fn should_merge(
     }
     // Containment, testing the shorter consensus against the longer. An end reaching more
     // than `collapse_gap` bp past the other's is a real extension, not a consensus wobble.
+    // An isoform at a validated downstream start is a transcript of its own, so a pair that
+    // differs at the 5' end stays apart when either is one.
     let gap = cfg.collapse_gap as i32;
+    let alt = small.alt_start || big.alt_start;
     if small.consensus.len() <= big.consensus.len() {
         // `small` placed on `big`; it may overhang `big`'s 5' end (a negative start).
         match fits_interval(small_map, big_map, &small.consensus, &big.consensus, strict) {
@@ -132,7 +136,7 @@ fn should_merge(
             Some((s, e)) if s < -gap => {
                 // Same 3' end: `small` is `big` with its 5' end intact. Otherwise the two
                 // differ at both ends and stay apart.
-                if e >= big.consensus.len() as i32 - cfg.boundary_tol as i32 {
+                if !alt && e >= big.consensus.len() as i32 - cfg.boundary_tol as i32 {
                     Merge::Extends
                 } else {
                     Merge::No
@@ -144,6 +148,7 @@ fn should_merge(
         // `big` placed on `small`: `small` extends it at the 5' end, the 3' end, or both.
         match fits_interval(big_map, small_map, &big.consensus, &small.consensus, strict) {
             None => Merge::No,
+            Some((s, _)) if s > gap && alt => Merge::No,
             Some((s, e)) if s > gap || e < small.consensus.len() as i32 - gap => Merge::Extends,
             Some(_) => Merge::Yes,
         }
@@ -191,13 +196,49 @@ mod tests {
         let maps: Vec<MinimizerMap> =
             reads.iter().map(|r| minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
         let isos = vec![
-            Isoform { members: (0..10).collect(), consensus: truth[500..].to_vec() },
-            Isoform { members: (10..13).collect(), consensus: truth.clone() },
+            Isoform {
+                members: (0..10).collect(),
+                consensus: truth[500..].to_vec(),
+                alt_start: false,
+            },
+            Isoform {
+                members: (10..13).collect(),
+                consensus: truth.clone(),
+                alt_start: false,
+            },
         ];
         let out = collapse(isos, &reads, &maps, &cfg);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].members.len(), 13);
         assert_eq!(out[0].consensus, truth);
+    }
+
+    #[test]
+    fn an_isoform_at_a_validated_start_is_not_folded_into_the_full_length_one() {
+        let truth = random_seq(1500, 5);
+        let mut seqs: Vec<Vec<u8>> = (0..10).map(|_| truth[500..].to_vec()).collect();
+        seqs.extend((0..3).map(|_| truth.clone()));
+        let reads: Vec<Read> = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Read { name: i.to_string(), seq: s.clone() })
+            .collect();
+        let cfg = Cfg::default();
+        let maps: Vec<MinimizerMap> =
+            reads.iter().map(|r| minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
+        let isos = vec![
+            Isoform {
+                members: (0..10).collect(),
+                consensus: truth[500..].to_vec(),
+                alt_start: true,
+            },
+            Isoform {
+                members: (10..13).collect(),
+                consensus: truth.clone(),
+                alt_start: false,
+            },
+        ];
+        assert_eq!(collapse(isos, &reads, &maps, &cfg).len(), 2);
     }
 
     #[test]
@@ -216,8 +257,16 @@ mod tests {
         let maps: Vec<MinimizerMap> =
             reads.iter().map(|r| minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
         let isos = vec![
-            Isoform { members: (0..10).collect(), consensus: truth[..900].to_vec() },
-            Isoform { members: (10..13).collect(), consensus: truth.clone() },
+            Isoform {
+                members: (0..10).collect(),
+                consensus: truth[..900].to_vec(),
+                alt_start: false,
+            },
+            Isoform {
+                members: (10..13).collect(),
+                consensus: truth.clone(),
+                alt_start: false,
+            },
         ];
         let out = collapse(isos, &reads, &maps, &cfg);
         assert_eq!(out.len(), 1);

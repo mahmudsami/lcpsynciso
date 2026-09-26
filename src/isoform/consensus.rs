@@ -17,6 +17,10 @@
 //!     its substring between those two anchors is that window's candidate;
 //!   * the window's consensus is the MOST FREQUENT exact candidate substring, so
 //!     a backbone error sits inside a majority-anchored window and is outvoted.
+//!   * where fewer than [`MIN_OWN`] of the isoform's own reads cover a boundary or vote in a
+//!     window, the other reads of its structure group vote too: same exons, other ends, so
+//!     the same sequence there (e.g. the full-length isoform borrowing the reads of an
+//!     isoform at a downstream start).
 //!
 //! The majority is local because most reads of an isoform are usually 5'-truncated. With a
 //! majority over ALL members, the 5' stretch that only the few full-length reads cover had
@@ -36,6 +40,7 @@
 //! are truncated or lost an anchor to a local error simply skip that window; the
 //! rest still carry it.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::anchors::{chain_anchors, shared_anchors, MinimizerMap};
@@ -45,9 +50,21 @@ use super::Read;
 /// can only tie, which keeps the backbone, so a stretch covered by the backbone alone or by
 /// one other read is left as it is.
 const MIN_VOTERS: u32 = 2;
+/// Where fewer than this many of the isoform's own reads cover a boundary or vote in a
+/// window, the other reads of its structure group vote too. They share its exon structure
+/// and differ only in their ends, so they carry the same sequence there. Where the isoform
+/// has enough reads of its own, only they vote, so a small real difference (a shifted
+/// splice site) is not outvoted by a sibling isoform.
+const MIN_OWN: u32 = 3;
+/// At most this many group reads help, the longest: stretches the isoform's own reads cover
+/// thinly are mostly its 5' end, which only long reads reach, and placing every read of a
+/// large group on every isoform's backbone would multiply the cost of this step.
+const MAX_HELPERS: usize = 16;
 
 /// Refine an isoform's consensus from its member reads (indices into `reads`),
 /// reusing minimizer maps already computed for the whole cluster (`maps[ri]`).
+/// `group` holds the reads of the isoform's structure group, which vote where fewer than
+/// [`MIN_OWN`] members do (pass `members` to use members only).
 /// Falls back to the backbone sequence for isoforms too small or too
 /// minimizer-poor to vote on.
 ///
@@ -57,6 +74,7 @@ const MIN_VOTERS: u32 = 2;
 pub fn refine_consensus_with_maps(
     reads: &[Read],
     members: &[usize],
+    group: &[usize],
     maps: &[MinimizerMap],
 ) -> Vec<u8> {
     // Backbone = longest member.
@@ -82,26 +100,37 @@ pub fn refine_consensus_with_maps(
     // Each member's collinear hits as (candidate index, read position), increasing in both.
     let hits: Vec<Vec<(u32, u32)>> =
         members.iter().map(|&ri| collinear_hits(&maps[ri], &maps[bb], &cand_of)).collect();
-
-    // Local depth (members whose chain spans a candidate) and support (members hitting it).
     let n = cand.len();
-    let mut depth_step = vec![0i32; n + 1];
-    let mut support = vec![0u32; n];
-    for h in &hits {
-        if let (Some(&(first, _)), Some(&(last, _))) = (h.first(), h.last()) {
-            depth_step[first as usize] += 1;
-            depth_step[last as usize + 1] -= 1;
+    let (depth, support) = depth_and_support(&hits, n);
+
+    // Where members alone are too few, the rest of the structure group helps.
+    let helpers: Vec<usize> = if depth.iter().any(|&d| d < MIN_OWN) {
+        let mut is_member = vec![false; reads.len()];
+        for &ri in members {
+            is_member[ri] = true;
         }
-        for &(ci, _) in h {
-            support[ci as usize] += 1;
+        let mut others: Vec<usize> = group.iter().copied().filter(|&ri| !is_member[ri]).collect();
+        if others.len() > MAX_HELPERS {
+            others.select_nth_unstable_by_key(MAX_HELPERS - 1, |&ri| Reverse(reads[ri].seq.len()));
+            others.truncate(MAX_HELPERS);
         }
-    }
+        others
+    } else {
+        Vec::new()
+    };
+    let helper_hits: Vec<Vec<(u32, u32)>> =
+        helpers.iter().map(|&ri| collinear_hits(&maps[ri], &maps[bb], &cand_of)).collect();
+    let (h_depth, h_support) = depth_and_support(&helper_hits, n);
+
     let mut breaks: Vec<usize> = Vec::new(); // candidate indices, increasing
-    let mut depth = 0i32;
     for ci in 0..n {
-        depth += depth_step[ci];
-        let majority = (depth.max(0) as u32) / 2 + 1; // strict majority of the local depth
-        if support[ci] >= majority.max(MIN_VOTERS) {
+        let (d, s) = if depth[ci] >= MIN_OWN {
+            (depth[ci], support[ci])
+        } else {
+            (depth[ci] + h_depth[ci], support[ci] + h_support[ci])
+        };
+        let majority = d / 2 + 1; // strict majority of the local depth
+        if s >= majority.max(MIN_VOTERS) {
             breaks.push(ci);
         }
     }
@@ -111,23 +140,37 @@ pub fn refine_consensus_with_maps(
     let m = breaks.len();
     let n_windows = m - 1;
 
-    // Per-window vote table: candidate segment bytes -> count.
-    let mut votes: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::new(); n_windows];
-    let mut rpos: Vec<Option<u32>> = vec![None; m];
-    for (h, &ri) in hits.iter().zip(members) {
-        // Read position at each boundary, if the read's chain holds it.
-        let mut k = 0;
-        for (bi, &ci) in breaks.iter().enumerate() {
-            while k < h.len() && (h[k].0 as usize) < ci {
-                k += 1;
+    // Per-window vote tables (candidate segment bytes -> count): members, and the helpers
+    // that join a window where fewer than MIN_OWN members vote.
+    let tally = |hits: &[Vec<(u32, u32)>], ids: &[usize]| {
+        let mut votes: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::new(); n_windows];
+        let mut rpos: Vec<Option<u32>> = vec![None; m];
+        for (h, &ri) in hits.iter().zip(ids) {
+            // Read position at each boundary, if the read's chain holds it.
+            let mut k = 0;
+            for (bi, &ci) in breaks.iter().enumerate() {
+                while k < h.len() && (h[k].0 as usize) < ci {
+                    k += 1;
+                }
+                rpos[bi] = (k < h.len() && h[k].0 as usize == ci).then(|| h[k].1);
             }
-            rpos[bi] = (k < h.len() && h[k].0 as usize == ci).then(|| h[k].1);
+            let seq = &reads[ri].seq;
+            for wi in 0..n_windows {
+                if let (Some(a), Some(b)) = (rpos[wi], rpos[wi + 1]) {
+                    let seg = seq[a as usize..b as usize].to_vec();
+                    *votes[wi].entry(seg).or_insert(0) += 1;
+                }
+            }
         }
-        let seq = &reads[ri].seq;
-        for wi in 0..n_windows {
-            if let (Some(a), Some(b)) = (rpos[wi], rpos[wi + 1]) {
-                let seg = seq[a as usize..b as usize].to_vec();
-                *votes[wi].entry(seg).or_insert(0) += 1;
+        votes
+    };
+    let mut votes = tally(&hits, members);
+    if !helpers.is_empty() {
+        for (own, extra) in votes.iter_mut().zip(tally(&helper_hits, &helpers)) {
+            if own.values().sum::<u32>() < MIN_OWN {
+                for (seg, c) in extra {
+                    *own.entry(seg).or_insert(0) += c;
+                }
             }
         }
     }
@@ -145,6 +188,28 @@ pub fn refine_consensus_with_maps(
 }
 
 const NONE: u32 = u32::MAX;
+
+/// Per candidate boundary: how many reads' chains span it, and how many hit it.
+fn depth_and_support(hits: &[Vec<(u32, u32)>], n: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut step = vec![0i32; n + 1];
+    let mut support = vec![0u32; n];
+    for h in hits {
+        if let (Some(&(first, _)), Some(&(last, _))) = (h.first(), h.last()) {
+            step[first as usize] += 1;
+            step[last as usize + 1] -= 1;
+        }
+        for &(ci, _) in h {
+            support[ci as usize] += 1;
+        }
+    }
+    let mut depth = Vec::with_capacity(n);
+    let mut d = 0i32;
+    for &x in &step[..n] {
+        d += x;
+        depth.push(d.max(0) as u32);
+    }
+    (depth, support)
+}
 
 /// A read's collinear hits on the backbone's candidate boundaries, as (candidate index, read
 /// position), increasing in both. `cand_of` maps a backbone position to its candidate index,
@@ -220,7 +285,7 @@ mod tests {
             .collect();
         let maps: Vec<MinimizerMap> = reads.iter().map(|r| minimizer_map(&r.seq, 15, 10)).collect();
         let members: Vec<usize> = (0..reads.len()).collect();
-        refine_consensus_with_maps(&reads, &members, &maps)
+        refine_consensus_with_maps(&reads, &members, &members, &maps)
     }
 
     #[test]
@@ -246,6 +311,28 @@ mod tests {
         let mut other = truth.clone();
         other.remove(300);
         assert_eq!(consensus_of(&[truth.clone(), other]), truth);
+    }
+
+    #[test]
+    fn group_reads_vote_where_the_isoform_has_too_few_of_its_own() {
+        // The isoform has the backbone (a 1-bp insertion at 500) and one correct full-length
+        // read: a tie, so its own reads keep the error. Three reads of another isoform of the
+        // same structure group cover position 500 correctly and break the tie.
+        let truth = random_seq(900, 23);
+        let mut backbone = truth.clone();
+        backbone.insert(500, b'T');
+        let seqs = vec![backbone, truth.clone(), truth[300..].to_vec(), truth[320..].to_vec(),
+                        truth[350..].to_vec()];
+        let reads: Vec<Read> = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Read { name: i.to_string(), seq: s.clone() })
+            .collect();
+        let maps: Vec<MinimizerMap> = reads.iter().map(|r| minimizer_map(&r.seq, 15, 10)).collect();
+        let members = [0, 1];
+        let group = [0, 1, 2, 3, 4];
+        assert_ne!(refine_consensus_with_maps(&reads, &members, &members, &maps), truth);
+        assert_eq!(refine_consensus_with_maps(&reads, &members, &group, &maps), truth);
     }
 
     #[test]
