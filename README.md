@@ -58,6 +58,10 @@ has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluste
 outside `--min-size`/`--max-size`. On the HiFi SIRV test data at `--min-iso 5`, 2.3% of
 reads were left out.
 
+With `--dump-clusters`, `predict` also writes `gene_clusters.tsv` (read_name, cluster_id,
+cluster_size, with a header row): the phase B cluster of every read, including the reads
+left out of `isoform_assignments.tsv`.
+
 `cluster` writes `summary.tsv`, `cluster_size_hist.tsv`, and, with `--emit-assignments`,
 `assignments.tsv` (read_name, cluster_id).
 
