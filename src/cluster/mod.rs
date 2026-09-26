@@ -3,14 +3,21 @@
 //!
 //! Seeds are synpact's LCP block hashes from levels L1..L`levels`. Only mid-frequency seeds
 //! are informative: found in at least `min_occ` reads (shared) and at most `max_occ`
-//! (not a repeat). Reads are then clustered in file order:
+//! (not a repeat). Reads are then clustered one at a time, in file order here and longest
+//! first in `predict`:
 //!
 //!   for each read:
 //!     each informative seed already claimed by a cluster votes for that cluster,
 //!       weighted by its level (higher levels are more specific)
-//!     if the best cluster's total weight >= min_shared  -> join it
-//!     otherwise                                          -> start a new cluster
+//!     if the best cluster's votes reach min_shared, and also min_shared_frac of
+//!       the read's total seed weight                 -> join it
+//!     otherwise                                      -> start a new cluster
 //!     the read's unclaimed seeds are claimed by its cluster
+//!
+//! A read of the same gene shares most of its seeds with that gene's cluster; a read of
+//! another gene may share a few by chance, such as a repeat in its UTR. The fraction keeps
+//! those few from merging unrelated genes, which a fixed `min_shared` cannot do for long
+//! reads without also splitting reads that have few seeds.
 //!
 //! The subcommand reads the file twice: pass 1 counts seed frequencies, pass 2 assigns.
 //! Seeds are computed in parallel per batch; assignment is sequential because it depends on
@@ -104,6 +111,8 @@ pub(crate) fn weighted_seeds(
 /// Assigns reads to clusters one at a time, in the order given (see the module docs).
 pub(crate) struct GreedyClusterer {
     min_shared: u32,
+    /// Fraction of the read's total seed weight the votes must also reach.
+    min_shared_frac: f64,
     /// Seed hash -> the cluster that claimed it first.
     owner: FastMap<u32>,
     /// Scratch for one read: cluster id -> total vote weight.
@@ -113,13 +122,21 @@ pub(crate) struct GreedyClusterer {
 }
 
 impl GreedyClusterer {
-    pub(crate) fn new(min_shared: u32) -> Self {
-        GreedyClusterer { min_shared, owner: fmap(), votes: fmap(), sizes: Vec::new() }
+    pub(crate) fn new(min_shared: u32, min_shared_frac: f64) -> Self {
+        GreedyClusterer {
+            min_shared,
+            min_shared_frac,
+            owner: fmap(),
+            votes: fmap(),
+            sizes: Vec::new(),
+        }
     }
 
     /// Assign a read, given its weighted informative seeds, and return its cluster id.
     pub(crate) fn assign(&mut self, seeds: &[(u64, u32)]) -> u32 {
         self.votes.clear();
+        let total: u32 = seeds.iter().map(|&(_, w)| w).sum();
+        let need = self.min_shared.max((self.min_shared_frac * total as f64).ceil() as u32);
         let mut best = u32::MAX;
         let mut best_w = 0u32;
         for (h, w) in seeds {
@@ -132,7 +149,7 @@ impl GreedyClusterer {
                 }
             }
         }
-        let cid = if best_w >= self.min_shared && best != u32::MAX {
+        let cid = if best_w >= need && best != u32::MAX {
             best
         } else {
             let new = self.sizes.len() as u32;
@@ -167,6 +184,8 @@ pub struct Config {
     pub max_occ: u32,
     /// Total vote weight needed to join a cluster.
     pub min_shared: u32,
+    /// ... and the fraction of the read's total seed weight it must also reach.
+    pub min_shared_frac: f64,
     /// Vote weight per level (index 0 = L1).
     pub weights: Vec<u32>,
     pub batch: usize,
@@ -187,6 +206,8 @@ impl Default for Config {
             min_occ: 2,
             max_occ: 100_000,
             min_shared: 8,
+            // Off: in file order with min_shared 8 it only trades merges for splits.
+            min_shared_frac: 0.0,
             weights: vec![1, 2, 5],
             batch: 500_000,
             max_reads: usize::MAX,
@@ -217,6 +238,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--min-occ" => a.min_occ = next().parse().unwrap(),
             "--max-occ" => a.max_occ = next().parse().unwrap(),
             "--min-shared" => a.min_shared = next().parse().unwrap(),
+            "--min-shared-frac" => a.min_shared_frac = next().parse().unwrap(),
             "--level-weights" => {
                 a.weights = next().split(',').map(|x| x.trim().parse().unwrap()).collect()
             }
@@ -264,6 +286,7 @@ OPTIONS:
     --max-occ N      ... and in <= N reads                     [100000]
     --level-weights a,b,c   per-level vote weights (L1,L2,..)  [1,2,5]
     --min-shared N   join a cluster if weighted shared >= N    [8]
+    --min-shared-frac F  ... and >= F of the read's seed weight [0 = off]
     --batch N        reads per batch                           [500000]
     --max-reads N    stop after N reads                        [all]
     --threads N      worker threads (0 = all)                  [0]
@@ -326,10 +349,10 @@ pub fn run(a: Config) {
 
     // ── Pass 2: greedy assignment ──
     eprintln!(
-        "[cluster] pass 2: greedy clustering (weights={:?}, min-shared={}) ...",
-        a.weights, a.min_shared
+        "[cluster] pass 2: greedy clustering (weights={:?}, min-shared={}, min-shared-frac={}) ...",
+        a.weights, a.min_shared, a.min_shared_frac
     );
-    let mut clusterer = GreedyClusterer::new(a.min_shared);
+    let mut clusterer = GreedyClusterer::new(a.min_shared, a.min_shared_frac);
 
     fs::create_dir_all(&a.out_dir).expect("mkdir out");
     let mut assignments = if a.emit_assignments {
@@ -436,8 +459,8 @@ fn write_outputs(
     summary.push_str(&format!("reads\t{n_reads}\n"));
     summary.push_str(&format!("k\t{}\ns\t{}\nlevels\t{}\n", a.k, a.s, a.levels));
     summary.push_str(&format!(
-        "min_occ\t{}\nmax_occ\t{}\nmin_shared\t{}\n",
-        a.min_occ, a.max_occ, a.min_shared
+        "min_occ\t{}\nmax_occ\t{}\nmin_shared\t{}\nmin_shared_frac\t{}\n",
+        a.min_occ, a.max_occ, a.min_shared, a.min_shared_frac
     ));
     summary.push_str(&format!(
         "level_weights\t{}\n",
@@ -459,8 +482,8 @@ fn write_outputs(
 
     println!();
     println!(
-        "  reads={n_reads}  k={} s={} L1..{}  band=[{},{}]  weights={:?}  min_shared={}",
-        a.k, a.s, a.levels, a.min_occ, a.max_occ, a.weights, a.min_shared
+        "  reads={n_reads}  k={} s={} L1..{}  band=[{},{}]  weights={:?}  min_shared={}  min_shared_frac={}",
+        a.k, a.s, a.levels, a.min_occ, a.max_occ, a.weights, a.min_shared, a.min_shared_frac
     );
     println!("  distinct seeds={total_distinct}  informative={informative_n}");
     println!("  clusters={n_clusters}  (singletons={singletons}, multi={})", n_clusters as u64 - singletons);
@@ -472,4 +495,24 @@ fn write_outputs(
     );
     println!();
     println!("  wrote summary.tsv + cluster_size_hist.tsv to {}/", a.out_dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GreedyClusterer;
+
+    /// Twenty unit-weight seeds, the first `shared` of which the first read also has.
+    fn read(shared: u64) -> Vec<(u64, u32)> {
+        (0..20).map(|i| (if i < shared { i } else { 1000 + i }, 1)).collect()
+    }
+
+    #[test]
+    fn min_shared_frac_needs_a_share_of_the_reads_own_seeds() {
+        // (min_shared_frac, seeds shared with cluster 0, joins cluster 0)
+        for (frac, shared, joins) in [(0.0, 3, true), (0.25, 3, false), (0.25, 5, true)] {
+            let mut c = GreedyClusterer::new(3, frac);
+            assert_eq!(c.assign(&read(20)), 0);
+            assert_eq!(c.assign(&read(shared)) == 0, joins, "frac={frac} shared={shared}");
+        }
+    }
 }

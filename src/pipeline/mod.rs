@@ -4,12 +4,14 @@
 //! ([`SeqStore`]), so clustering hands sequences straight to isoform resolution. Three phases:
 //!
 //!   A. Read and pack every read, counting how many reads contain each seed.
-//!   B. Cluster the stored reads greedily, in file order ([`GreedyClusterer`]).
+//!   B. Cluster the stored reads greedily, longest first ([`GreedyClusterer`]).
 //!   C. Resolve each cluster into isoforms ([`isoform::resolve_cluster`]), in parallel across
-//!      clusters, and write the output files.
+//!      clusters, largest first, and write the output files.
 
 use std::cmp::Reverse;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -37,6 +39,7 @@ pub struct Config {
     pub min_occ: u32,
     pub max_occ: u32,
     pub min_shared: u32,
+    pub min_shared_frac: f64,
     pub weights: Vec<u32>,
     // Which clusters to resolve, by read count.
     pub min_size: usize,
@@ -60,6 +63,7 @@ impl Default for Config {
             min_occ: 2,
             max_occ: 100_000,
             min_shared: 3,
+            min_shared_frac: 0.10,
             weights: vec![1, 2, 5],
             min_size: 1,
             max_size: usize::MAX,
@@ -92,6 +96,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--min-occ" => a.min_occ = next().parse().unwrap(),
             "--max-occ" => a.max_occ = next().parse().unwrap(),
             "--min-shared" => a.min_shared = next().parse().unwrap(),
+            "--min-shared-frac" => a.min_shared_frac = next().parse().unwrap(),
             "--level-weights" => {
                 a.weights = next().split(',').map(|x| x.trim().parse().unwrap()).collect()
             }
@@ -147,6 +152,7 @@ CLUSTERING (seeds):
     --max-occ N             ... and in <= N reads                        [100000]
     --level-weights a,b,c   per-level vote weights                       [1,2,5]
     --min-shared N          join a cluster if weighted shared >= N       [3]
+    --min-shared-frac F     ... and >= F of the read's seed weight       [0.1]
 
 ISOFORMS:
     --min-size N            skip clusters with fewer reads               [1]
@@ -162,9 +168,6 @@ OUTPUT (in DIR):
     isoforms.fasta            refined consensus per isoform"
     );
 }
-
-/// Clusters resolved per parallel chunk; bounds how many rendered clusters wait in memory.
-const CHUNK: usize = 4000;
 
 pub fn run(a: Config) {
     if a.threads > 0 {
@@ -197,7 +200,10 @@ pub fn run(a: Config) {
 
     // ── Phase B: cluster ──
     let t_b0 = Instant::now();
-    eprintln!("[predict] phase B: greedy clustering (min-shared={}) ...", a.min_shared);
+    eprintln!(
+        "[predict] phase B: greedy clustering (min-shared={}, min-shared-frac={}) ...",
+        a.min_shared, a.min_shared_frac
+    );
     let members = cluster_reads(&a, params, &store, informative);
     let n_clusters = members.len();
     let t_b = t_b0.elapsed();
@@ -217,24 +223,24 @@ pub fn run(a: Config) {
         targets.len()
     );
 
-    let mut out = OutputFiles::create(&a.out_dir);
-    let (mut total_iso, mut n_resolved) = (0usize, 0usize);
+    let writer = Mutex::new(OrderedWriter::new(OutputFiles::create(&a.out_dir)));
     let t_unpack = AtomicU64::new(0);
     let t_render = AtomicU64::new(0);
-    for chunk in targets.chunks(CHUNK) {
-        let rendered: Vec<(Rendered, usize)> = chunk
-            .par_iter()
-            .map(|&cid| {
-                resolve_one(cid, &members[cid as usize], &store, &a.cfg, &t_unpack, &t_render)
-            })
-            .collect();
-        for (records, n_iso) in rendered {
-            out.append(&records);
-            total_iso += n_iso;
-            n_resolved += 1;
+    let finished = AtomicUsize::new(0);
+    // Largest cluster first, each to whichever thread is free: `par_bridge` hands out one
+    // cluster at a time, so the largest clusters spread over all threads. (An indexed
+    // `par_iter` splits the list into contiguous ranges, and one thread would get the first
+    // range: every one of the largest clusters.)
+    targets.iter().enumerate().par_bridge().for_each(|(k, &cid)| {
+        let (records, n_iso) =
+            resolve_one(cid, &members[cid as usize], &store, &a.cfg, &t_unpack, &t_render);
+        writer.lock().unwrap().push(k, records, n_iso);
+        let done = finished.fetch_add(1, Relaxed) + 1;
+        if done % 10_000 == 0 {
+            eprintln!("[predict]   phase C {} of {} clusters ...", done, targets.len());
         }
-    }
-    out.flush();
+    });
+    let (total_iso, n_resolved) = writer.into_inner().unwrap().finish();
     let t_c = t_c0.elapsed();
 
     // ── Report ──
@@ -305,8 +311,44 @@ fn load_reads(a: &Config, params: SeedParams) -> (SeqStore, SeedCounts, [Duratio
     (store, counts, [d_read, d_seed, d_pack])
 }
 
-/// Phase B: cluster the stored reads in file order and return each cluster's member read
-/// indices. Seeds are computed in parallel per batch; assignment is sequential.
+/// The clustering order: longest read first, ties in file order. A counting sort over read
+/// lengths, so visiting the reads in file order yields each one's rank without storing a
+/// read -> rank table.
+struct LengthRanks {
+    /// Read length -> rank of the next read of that length.
+    next: BTreeMap<usize, u32>,
+}
+
+impl LengthRanks {
+    fn new(store: &SeqStore) -> Self {
+        let mut next: BTreeMap<usize, u32> = BTreeMap::new();
+        for i in 0..store.len() {
+            *next.entry(store.read_len(i)).or_insert(0) += 1;
+        }
+        // Counts -> first rank of each length, longest first.
+        let mut rank = 0u32;
+        for c in next.values_mut().rev() {
+            let count = *c;
+            *c = rank;
+            rank += count;
+        }
+        LengthRanks { next }
+    }
+
+    /// Rank of the next read of length `len`, visiting reads in file order.
+    fn rank(&mut self, len: usize) -> usize {
+        let r = self.next.get_mut(&len).expect("length counted in LengthRanks::new");
+        *r += 1;
+        (*r - 1) as usize
+    }
+}
+
+/// Phase B: cluster the stored reads, longest first, and return each cluster's member read
+/// indices in file order. Seeds are computed in parallel per batch; assignment is sequential.
+///
+/// The reads stay where they are in the store. One `u32` per read, `slot`, first holds the
+/// read at each rank, then, once that read is assigned, its cluster id. So sorting costs
+/// no memory beyond the per-read cluster id that clustering needs anyway.
 fn cluster_reads(
     a: &Config,
     params: SeedParams,
@@ -314,17 +356,22 @@ fn cluster_reads(
     informative: FastMap<u8>,
 ) -> Vec<Vec<u32>> {
     let n = store.len();
-    let mut cluster_of: Vec<u32> = vec![0; n];
-    let mut clusterer = GreedyClusterer::new(a.min_shared);
+    let mut slot: Vec<u32> = vec![0; n];
+    let mut ranks = LengthRanks::new(store);
+    for i in 0..n {
+        slot[ranks.rank(store.read_len(i))] = i as u32;
+    }
+
+    let mut clusterer = GreedyClusterer::new(a.min_shared, a.min_shared_frac);
     let mut start = 0;
     while start < n {
         let end = (start + a.batch).min(n);
-        let seeds: Vec<Vec<(u64, u32)>> = (start..end)
-            .into_par_iter()
-            .map(|i| weighted_seeds(&store.get(i), params, &informative, &a.weights))
+        let seeds: Vec<Vec<(u64, u32)>> = slot[start..end]
+            .par_iter()
+            .map(|&i| weighted_seeds(&store.get(i as usize), params, &informative, &a.weights))
             .collect();
         for (offset, read_seeds) in seeds.iter().enumerate() {
-            cluster_of[start + offset] = clusterer.assign(read_seeds);
+            slot[start + offset] = clusterer.assign(read_seeds);
         }
         eprintln!("[predict]   phase B {} reads, {} clusters ...", end, clusterer.n_clusters());
         start = end;
@@ -334,11 +381,49 @@ fn cluster_reads(
     drop(clusterer);
     drop(informative);
 
+    // Replay the ranks in file order to map each read to its cluster id.
+    let mut ranks = LengthRanks::new(store);
     let mut members: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
-    for (i, &c) in cluster_of.iter().enumerate() {
+    for i in 0..n {
+        let c = slot[ranks.rank(store.read_len(i))];
         members[c as usize].push(i as u32);
     }
     members
+}
+
+/// Phase C output. Clusters finish in any order but are written in `targets` order, so the
+/// output files do not depend on thread timing: a finished cluster waits here until every
+/// cluster before it has been written.
+struct OrderedWriter {
+    out: OutputFiles,
+    /// Finished clusters by position in `targets`, with their isoform counts.
+    waiting: BTreeMap<usize, (Rendered, usize)>,
+    /// Position of the next cluster to write.
+    next: usize,
+    total_iso: usize,
+}
+
+impl OrderedWriter {
+    fn new(out: OutputFiles) -> Self {
+        OrderedWriter { out, waiting: BTreeMap::new(), next: 0, total_iso: 0 }
+    }
+
+    /// Take the finished cluster at position `k`, then write every cluster now next in line.
+    fn push(&mut self, k: usize, records: Rendered, n_iso: usize) {
+        self.waiting.insert(k, (records, n_iso));
+        while let Some((records, n_iso)) = self.waiting.remove(&self.next) {
+            self.out.append(&records);
+            self.total_iso += n_iso;
+            self.next += 1;
+        }
+    }
+
+    /// Flush the files. Returns the isoform count and the number of clusters written.
+    fn finish(mut self) -> (usize, usize) {
+        assert!(self.waiting.is_empty(), "a cluster before position {} never finished", self.next);
+        self.out.flush();
+        (self.total_iso, self.next)
+    }
 }
 
 /// Phase C for one cluster, on a worker thread: unpack its reads, resolve its isoforms, and

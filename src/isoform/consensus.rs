@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use super::anchors::MinimizerMap;
 use super::Read;
 
 /// Refine an isoform's consensus from its member reads (indices into `reads`),
@@ -45,7 +46,7 @@ use super::Read;
 pub fn refine_consensus_with_maps(
     reads: &[Read],
     members: &[usize],
-    maps: &[HashMap<u64, Vec<u32>>],
+    maps: &[MinimizerMap],
 ) -> Vec<u8> {
     // Backbone = longest member.
     let bb = *members.iter().max_by_key(|&&i| reads[i].seq.len()).unwrap();
@@ -57,7 +58,7 @@ pub fn refine_consensus_with_maps(
     // How many members carry each minimizer code.
     let mut freq: HashMap<u64, u32> = HashMap::new();
     for &ri in members {
-        for &c in maps[ri].keys() {
+        for (c, _) in maps[ri].runs() {
             *freq.entry(c).or_insert(0) += 1;
         }
     }
@@ -67,10 +68,10 @@ pub fn refine_consensus_with_maps(
     // ordered by position. Positions are k-mer starts and, once restricted to codes unique
     // in the backbone, all distinct, so the sort is strictly increasing.
     let mut breaks: Vec<(u32, u64)> = maps[bb]
-        .iter()
+        .runs()
         .filter(|(_, p)| p.len() == 1)
-        .filter(|(c, _)| freq[*c] >= thresh)
-        .map(|(&c, p)| (p[0], c))
+        .filter(|(c, _)| freq[c] >= thresh)
+        .map(|(c, p)| (p[0], c))
         .collect();
     breaks.sort_unstable();
     if breaks.len() < 2 {
@@ -91,10 +92,10 @@ pub fn refine_consensus_with_maps(
         let mut last = -1i64;
         let mut rpos: Vec<Option<u32>> = Vec::with_capacity(m);
         for &(_p, c) in &breaks {
-            match rmap.get(&c) {
-                Some(ps) if ps.len() == 1 && (ps[0] as i64) > last => {
-                    rpos.push(Some(ps[0]));
-                    last = ps[0] as i64;
+            match rmap.get(c) {
+                &[p] if (p as i64) > last => {
+                    rpos.push(Some(p));
+                    last = p as i64;
                 }
                 _ => rpos.push(None),
             }

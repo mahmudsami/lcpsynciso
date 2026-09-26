@@ -39,8 +39,9 @@ Input is FASTA or FASTQ, plain or gzip/bgzf; compression is recognised by a `.gz
 already be oriented (for example PacBio FLNC reads).
 
 `--threads` (default 0, meaning all cores) applies to `predict` and `cluster`. Run
-`lcpsynciso <command> --help` for every option and its default. Note that the default
-`--min-shared` differs: 3 for `predict`, 8 for `cluster`.
+`lcpsynciso <command> --help` for every option and its default. Note that the clustering
+thresholds differ: `--min-shared` is 3 for `predict` and 8 for `cluster`, and
+`--min-shared-frac` is 0.1 for `predict` and off for `cluster`.
 
 ### Outputs
 
@@ -63,10 +64,15 @@ reads were left out.
 ## How it works
 
 **Clustering.** Seeds are LCP-syncmer block hashes from several levels. Only seeds found
-in between `--min-occ` and `--max-occ` reads are used. Reads are clustered greedily in file
-order: each seed already claimed by a cluster votes for it, weighted by the seed's level.
-A read joins the winning cluster if its total reaches `--min-shared`, and otherwise starts
-a new cluster.
+in between `--min-occ` and `--max-occ` reads are used. Reads are clustered greedily: in
+`predict`, longest read first (ties in file order), so each cluster is seeded by its most
+complete read; in `cluster`, which does not hold the reads, in file order. Each seed
+already claimed by a cluster votes for it, weighted by the seed's level. A read joins the
+winning cluster if its votes reach `--min-shared` and also `--min-shared-frac` of the
+read's own total seed weight, and otherwise starts a new cluster. The fraction stops a read
+from joining an unrelated gene's cluster through a few seeds shared by chance, such as a
+repeat in a UTR; longest-first order needs it, because the longest reads start clusters
+first.
 
 **Isoforms**, per cluster:
 

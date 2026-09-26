@@ -8,10 +8,74 @@
 //! both sequences.
 
 use std::cell::RefCell;
-use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
 
 // ── Minimizers ───────────────────────────────────────────────────────────────
+
+/// A sequence's minimizers: every code with every position where it is the window minimum,
+/// as two parallel arrays sorted by code, then position. About 12 bytes per minimizer, in
+/// two allocations; resolution holds one of these for every read of every cluster in flight.
+#[derive(Debug)]
+pub(super) struct MinimizerMap {
+    codes: Box<[u64]>,
+    pos: Box<[u32]>,
+}
+
+impl MinimizerMap {
+    /// Positions of `code`, increasing; empty if the sequence lacks it.
+    pub(super) fn get(&self, code: u64) -> &[u32] {
+        let lo = self.codes.partition_point(|&c| c < code);
+        let hi = lo + self.codes[lo..].partition_point(|&c| c == code);
+        &self.pos[lo..hi]
+    }
+
+    /// Each distinct code with its positions, in code order.
+    pub(super) fn runs(&self) -> impl Iterator<Item = (u64, &[u32])> {
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            let code = *self.codes.get(i)?;
+            let end = run_end(&self.codes, i);
+            let run = (code, &self.pos[i..end]);
+            i = end;
+            Some(run)
+        })
+    }
+}
+
+/// End of the run of equal codes starting at `i`.
+fn run_end(codes: &[u64], i: usize) -> usize {
+    let mut end = i + 1;
+    while end < codes.len() && codes[end] == codes[i] {
+        end += 1;
+    }
+    end
+}
+
+/// Every (read position, backbone position) pair at which the two sequences share a
+/// minimizer code: each shared code pairs each of its read positions with each of its
+/// backbone positions. A merge of the two sorted code arrays, so no hashing.
+pub(super) fn shared_anchors(read: &MinimizerMap, backbone: &MinimizerMap) -> Vec<(u32, u32)> {
+    let (a, b) = (&read.codes, &backbone.codes);
+    let (mut i, mut j) = (0, 0);
+    let mut anchors = Vec::new();
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                let (i_end, j_end) = (run_end(a, i), run_end(b, j));
+                for &p in &read.pos[i..i_end] {
+                    for &q in &backbone.pos[j..j_end] {
+                        anchors.push((p, q));
+                    }
+                }
+                i = i_end;
+                j = j_end;
+            }
+        }
+    }
+    anchors
+}
 
 /// 2-bit code and start position of every k-mer; k-mers containing a non-ACGT base are skipped.
 fn encode_kmers(seq: &[u8], k: usize) -> Vec<(u64, u32)> {
@@ -39,10 +103,10 @@ fn encode_kmers(seq: &[u8], k: usize) -> Vec<(u64, u32)> {
     out
 }
 
-/// Window-`w` minimizers of `seq`, as code -> every position where it is the window minimum
-/// (in increasing order). Most codes carry exactly one position; a code the window picks
-/// more than once (a repeated minimizer) carries all of them.
-pub(super) fn minimizer_map(seq: &[u8], k: usize, w: usize) -> HashMap<u64, Vec<u32>> {
+/// Window-`w` minimizers of `seq`: each code with every position where it is the window
+/// minimum. Most codes carry exactly one position; a code the window picks more than once
+/// (a repeated minimizer) carries all of them.
+pub(super) fn minimizer_map(seq: &[u8], k: usize, w: usize) -> MinimizerMap {
     let kms = encode_kmers(seq, k);
     let mut picks: Vec<(u64, u32)> = Vec::new();
     if kms.len() < w.max(1) {
@@ -58,14 +122,12 @@ pub(super) fn minimizer_map(seq: &[u8], k: usize, w: usize) -> HashMap<u64, Vec<
             }
         }
     }
-    let mut map: HashMap<u64, Vec<u32>> = HashMap::with_capacity(picks.len());
-    for (code, pos) in picks {
-        if is_homopolymer(code, k) {
-            continue;
-        }
-        map.entry(code).or_default().push(pos);
+    picks.retain(|&(code, _)| !is_homopolymer(code, k));
+    picks.sort_unstable();
+    MinimizerMap {
+        codes: picks.iter().map(|&(c, _)| c).collect(),
+        pos: picks.iter().map(|&(_, p)| p).collect(),
     }
-    map
 }
 
 /// Whether every base of `code`'s k-mer is the same, as in a polyA tail. Such a k-mer is the
@@ -179,7 +241,25 @@ mod tests {
         // "AAAC" (code 1) is the window minimum at both position 0 and position 10. The old
         // unique-only filter dropped such a code entirely; every occurrence is kept now.
         let map = minimizer_map(b"AAACTTTTTTAAACTTTTTT", 4, 2);
-        assert_eq!(map.get(&1u64).map(Vec::as_slice), Some(&[0u32, 10][..]));
+        assert_eq!(map.get(1), &[0u32, 10][..]);
+    }
+
+    #[test]
+    fn shared_anchors_pairs_every_occurrence_of_each_shared_code() {
+        // Code 1 at read 0 and 10 and backbone 5; code 7 at read 3 and backbone 8 and 20;
+        // code 9 only in the read and code 4 only in the backbone.
+        let read = MinimizerMap {
+            codes: vec![1, 1, 7, 9].into(),
+            pos: vec![0, 10, 3, 6].into(),
+        };
+        let backbone = MinimizerMap {
+            codes: vec![1, 4, 7, 7].into(),
+            pos: vec![5, 2, 8, 20].into(),
+        };
+        let mut anchors = shared_anchors(&read, &backbone);
+        anchors.sort_unstable();
+        assert_eq!(anchors, vec![(0, 5), (3, 8), (3, 20), (10, 5)]);
+        assert_eq!(read.runs().map(|(c, p)| (c, p.len())).collect::<Vec<_>>(), vec![(1, 2), (7, 1), (9, 1)]);
     }
 
     #[test]
@@ -187,10 +267,10 @@ mod tests {
         // Every k-mer of a polyA run is the same code, one per position: a ladder of equally
         // valid anchors that drags a chain to an arbitrary offset inside the tail.
         let map = minimizer_map(b"AAAAAAAA", 3, 4);
-        assert!(map.is_empty(), "the all-A 3-mer must not be an anchor, got {map:?}");
+        assert!(map.runs().next().is_none(), "the all-A 3-mer must not be an anchor, got {map:?}");
         // The polyT 4-mer in the sequence above is excluded for the same reason.
         let map = minimizer_map(b"AAACTTTTTTAAACTTTTTT", 4, 2);
-        assert!(!map.contains_key(&255u64), "polyT must not be an anchor");
+        assert!(map.get(255).is_empty(), "polyT must not be an anchor");
     }
 
     #[test]
