@@ -35,6 +35,10 @@ pub struct Cfg {
     pub min_variant_frac: f64,
 
     // Step 3: split by read ends. (`ends.rs`)
+    /// Split by where reads start as well as where they end. False splits by 3' ends only,
+    /// and a read that reaches further 5' than an isoform still joins it: in cDNA most reads
+    /// are 5'-truncated, so start peaks mark truncation, not transcription start sites.
+    pub split_starts: bool,
     /// Group read ends by the peaks they form; false uses a fixed `boundary_tol` grid.
     pub end_modes: bool,
     /// Window (bp) used to find end peaks.
@@ -75,6 +79,7 @@ impl Default for Cfg {
             max_flank: 25,
             polya_clamp: true,
             min_variant_frac: 0.0,
+            split_starts: true,
             end_modes: true,
             peak_width: 10,
             boundary_tol: 150,
@@ -102,6 +107,8 @@ pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> St
         "--polya-clamp" => cfg.polya_clamp = true,
         "--no-polya-clamp" => cfg.polya_clamp = false,
         "--min-variant-frac" => cfg.min_variant_frac = next().parse().unwrap(),
+        "--split-starts" => cfg.split_starts = true,
+        "--no-split-starts" => cfg.split_starts = false,
         "--end-modes" => cfg.end_modes = true,
         "--no-end-modes" => cfg.end_modes = false,
         "--peak-width" => cfg.peak_width = next().parse().unwrap(),
@@ -138,6 +145,10 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
                             the SAME >=2 bp indel at the SAME position; 0 = off
 
 READ ENDS (a structure group splits into isoforms by where its reads start and end):
+    --split-starts / --no-split-starts
+                            split by read starts as well as ends; with   [on]
+                            --no-split-starts only 3' ends split, and a read
+                            reaching further 5' than an isoform joins it
     --end-modes / --no-end-modes
                             group ends by the peaks they form, or on a   [peaks]
                             fixed --boundary-tol grid

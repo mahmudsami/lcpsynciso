@@ -21,6 +21,7 @@
 //!   different sequence at one end                         unmatched flank          step 1
 //!   a splice site shifted by a few bases                  recurrent indel          step 2
 //!   different transcription start or end                  end peaks                step 3
+//!     (3' ends only with `split_starts` off: 5' starts in cDNA mostly mark truncation)
 //!   the same transcript found by two groups               consensus identity       step 5
 //!
 //! Differences confined to a flank shorter than `max_flank` are not detected. The defaults
@@ -92,7 +93,7 @@ pub(crate) fn resolve_cluster(reads: &[Read], cfg: &Cfg) -> Vec<Isoform> {
     stats::add_elapsed(&stats::T_CONS, t);
 
     if cfg.collapse {
-        collapse::collapse(isoforms, cfg)
+        collapse::collapse(isoforms, reads, &maps, cfg)
     } else {
         isoforms
     }

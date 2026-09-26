@@ -9,6 +9,13 @@
 //! A (start, end) key pair held by at least `min_iso` reads is an isoform. Any other read,
 //! typically a truncated copy, joins the best-supported isoform whose extent contains it,
 //! or is dropped.
+//!
+//! With `split_starts` off, every read has the same start key, so only 3' ends split a group,
+//! and containment is tested at the 3' end only: a read that reaches further 5' than an
+//! isoform is a more complete copy of it, not a different transcript. In cDNA most reads are
+//! 5'-truncated, so the truncated majority forms tight start peaks while the few full-length
+//! reads, whose starts smear over ~100 bp, form none; splitting by starts then made the
+//! truncated majority an isoform of its own and dropped the full-length reads.
 
 use std::collections::HashMap;
 
@@ -18,7 +25,7 @@ use super::{stats, Cfg, Member};
 pub(super) fn split_by_ends(members: &[Member], cfg: &Cfg) -> Vec<Vec<usize>> {
     let tol = cfg.boundary_tol.max(1) as i32;
 
-    let (start_key, end_key): (Vec<Option<i32>>, Vec<Option<i32>>) = if cfg.end_modes {
+    let (mut start_key, end_key): (Vec<Option<i32>>, Vec<Option<i32>>) = if cfg.end_modes {
         let width = cfg.peak_width.max(1) as i32;
         let start_peaks = find_peaks(members.iter().map(|m| m.1), width, cfg.min_iso);
         let end_peaks = find_peaks(members.iter().map(|m| m.2), width, cfg.min_iso);
@@ -32,6 +39,9 @@ pub(super) fn split_by_ends(members: &[Member], cfg: &Cfg) -> Vec<Vec<usize>> {
             members.iter().map(|m| Some(m.2.div_euclid(tol))).collect(),
         )
     };
+    if !cfg.split_starts {
+        start_key.fill(Some(0));
+    }
     let key_of = |mi: usize| match (start_key[mi], end_key[mi]) {
         (Some(a), Some(b)) => Some((a, b)),
         _ => None,
@@ -74,11 +84,13 @@ pub(super) fn split_by_ends(members: &[Member], cfg: &Cfg) -> Vec<Vec<usize>> {
                 continue;
             }
         }
-        // Otherwise: the best-supported isoform whose extent contains [s, e], within tol.
+        // Otherwise: the best-supported isoform whose extent contains [s, e], within tol —
+        // at the 3' end only when starts don't split.
         let mut best: Option<(i32, i32)> = None;
         let mut best_sup = 0usize;
         for (key, &(is, ie, sup)) in &isoforms {
-            if is <= s + tol && ie >= e - tol && sup > best_sup {
+            let starts_inside = !cfg.split_starts || is <= s + tol;
+            if starts_inside && ie >= e - tol && sup > best_sup {
                 best_sup = sup;
                 best = Some(*key);
             }
@@ -139,4 +151,49 @@ fn nearest_peak(peaks: &[i32], x: i32, radius: i32) -> Option<i32> {
         .copied()
         .filter(|&m| (m - x).abs() <= radius)
         .min_by_key(|&m| ((m - x).abs(), m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sorted member counts of the isoforms `split_by_ends` returns.
+    fn sizes(members: &[Member], cfg: &Cfg) -> Vec<usize> {
+        let mut s: Vec<usize> = split_by_ends(members, cfg).iter().map(|m| m.len()).collect();
+        s.sort_unstable();
+        s
+    }
+
+    /// Three full-length reads whose starts smear over ~100 bp, and eight 5'-truncated reads
+    /// that all start near 800; every read ends at the same polyA site near 2000.
+    fn truncated_majority() -> Vec<Member> {
+        let mut m: Vec<Member> = vec![(0, 0, 2000), (1, 40, 2003), (2, 95, 1998)];
+        for (i, s) in [800, 802, 805, 801, 803, 799, 804, 806].into_iter().enumerate() {
+            m.push((3 + i, s, 2000 + i as i32 % 3));
+        }
+        m
+    }
+
+    #[test]
+    fn start_split_drops_full_length_reads_of_a_truncated_majority() {
+        // The truncated reads form a start peak, the full-length reads none; not contained
+        // in the truncated isoform's extent, they are dropped.
+        assert_eq!(sizes(&truncated_majority(), &Cfg::default()), vec![8]);
+    }
+
+    #[test]
+    fn without_start_split_full_length_reads_join_their_isoform() {
+        let cfg = Cfg { split_starts: false, ..Cfg::default() };
+        assert_eq!(sizes(&truncated_majority(), &cfg), vec![11]);
+    }
+
+    #[test]
+    fn without_start_split_alternative_polya_sites_still_split() {
+        let cfg = Cfg { split_starts: false, ..Cfg::default() };
+        let m: Vec<Member> = vec![
+            (0, 0, 2000), (1, 300, 2002), (2, 700, 1999), (3, 900, 2001),
+            (4, 5, 2600), (5, 350, 2604), (6, 650, 2598), (7, 1000, 2601),
+        ];
+        assert_eq!(sizes(&m, &cfg), vec![4, 4]);
+    }
 }

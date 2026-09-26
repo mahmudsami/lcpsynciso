@@ -90,11 +90,17 @@ first.
    differ by a few bases, such as a shifted splice site, share the same indel position.
 3. **Split by read ends.** Reads that share a start peak and an end peak form an isoform
    if there are at least `--min-iso` of them. Other reads join the best-supported isoform
-   that contains them, or are dropped. Groups smaller than `--min-iso` are dropped.
-4. **Consensus.** The longest read is cut into windows at minimizers shared by a majority
-   of the isoform's reads; each window takes the most frequent read substring. No
-   multiple alignment is needed.
-5. **Merge duplicates:** isoforms whose consensuses show they are the same transcript.
+   that contains them, or are dropped. Groups smaller than `--min-iso` are dropped. With
+   `--no-split-starts` only 3' end peaks split, and a read reaching further 5' than an
+   isoform joins it. In cDNA most reads are 5'-truncated, so start peaks mostly mark
+   truncation; splitting by them made the truncated majority an isoform of its own and
+   dropped the few full-length reads.
+4. **Consensus.** The longest read is cut into windows at minimizers carried by a majority
+   of the reads covering that position (at least 2); each window takes the most frequent
+   read substring. No multiple alignment is needed.
+5. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
+   the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
+   past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
 
 ## Notes
 
