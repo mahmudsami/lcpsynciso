@@ -9,11 +9,11 @@
 //!     anchor. A flank left unmatched while backbone sequence remains means the sequences
 //!     diverge; a flank unmatched only because the backbone ran out is an overhang.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
+use super::anchors::{self, MinimizerMap};
 use super::stats::{self, Reject};
-use super::{anchors, ba, Cfg};
+use super::{ba, Cfg};
 
 /// Test whether `read` has the same structure as `backbone`. If it does, return the read's
 /// start and end in backbone coordinates; a read that overhangs the backbone gets a negative
@@ -21,8 +21,8 @@ use super::{anchors, ba, Cfg};
 ///
 /// `read_map` and `backbone_map` are the minimizer maps of the two sequences.
 pub(super) fn fits_interval(
-    read_map: &HashMap<u64, Vec<u32>>,
-    backbone_map: &HashMap<u64, Vec<u32>>,
+    read_map: &MinimizerMap,
+    backbone_map: &MinimizerMap,
     read: &[u8],
     backbone: &[u8],
     cfg: &Cfg,
@@ -33,16 +33,7 @@ pub(super) fn fits_interval(
     // Every shared minimizer code pairs each of its read positions with each of its backbone
     // positions; a code unique to both sequences (the common case) contributes exactly one.
     let t_anchor = Instant::now();
-    let mut anchors: Vec<(u32, u32)> = Vec::new();
-    for (c, is) in read_map.iter() {
-        if let Some(js) = backbone_map.get(c) {
-            for &i in is {
-                for &j in js {
-                    anchors.push((i, j));
-                }
-            }
-        }
-    }
+    let mut anchors = anchors::shared_anchors(read_map, backbone_map);
     if anchors.len() < cfg.min_anchors {
         stats::add_elapsed(&stats::T_ANCHOR, t_anchor);
         return reject(Reject::FewAnchors);

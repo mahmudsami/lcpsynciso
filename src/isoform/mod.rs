@@ -27,7 +27,6 @@
 //! were tuned on PacBio HiFi SIRV reads; ONT data has not been measured.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::time::Instant;
 
 mod anchors; // minimizer anchors and their collinear chain
@@ -42,6 +41,7 @@ mod output; // output files
 pub(crate) mod stats; // diagnostic counters
 mod variant; // step 2
 
+use anchors::MinimizerMap;
 pub use cli::{parse_args, run, usage, Config};
 pub use options::Cfg;
 pub(crate) use options::{parse_flag, RESOLVE_HELP};
@@ -68,7 +68,7 @@ type Member = (usize, i32, i32);
 /// resolve many in parallel.
 pub(crate) fn resolve_cluster(reads: &[Read], cfg: &Cfg) -> Vec<Isoform> {
     let t = Instant::now();
-    let maps: Vec<HashMap<u64, Vec<u32>>> =
+    let maps: Vec<MinimizerMap> =
         reads.iter().map(|r| anchors::minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
     stats::add_elapsed(&stats::T_MAPS, t);
 
@@ -99,7 +99,7 @@ pub(crate) fn resolve_cluster(reads: &[Read], cfg: &Cfg) -> Vec<Isoform> {
 }
 
 /// Steps 1–3 and the `min_iso` filter: member read indices of each isoform, largest first.
-fn partition(reads: &[Read], maps: &[HashMap<u64, Vec<u32>>], cfg: &Cfg) -> Vec<Vec<usize>> {
+fn partition(reads: &[Read], maps: &[MinimizerMap], cfg: &Cfg) -> Vec<Vec<usize>> {
     let mut isoforms: Vec<Vec<usize>> = Vec::new();
     for group in &group_by_structure(reads, maps, cfg) {
         let backbone = group[0].0;
@@ -120,7 +120,7 @@ fn partition(reads: &[Read], maps: &[HashMap<u64, Vec<u32>>], cfg: &Cfg) -> Vec<
 /// One round usually takes in a whole dominant structure, because every truncated copy of
 /// the longest read fits it; only reads of other structures carry over. A cluster holding
 /// one gene therefore costs about one test per read.
-fn group_by_structure(reads: &[Read], maps: &[HashMap<u64, Vec<u32>>], cfg: &Cfg) -> Vec<Vec<Member>> {
+fn group_by_structure(reads: &[Read], maps: &[MinimizerMap], cfg: &Cfg) -> Vec<Vec<Member>> {
     // Longest first. Filtering keeps the order, so remaining[0] is always the next backbone.
     let mut remaining: Vec<usize> = (0..reads.len()).collect();
     remaining.sort_by_key(|&i| Reverse(reads[i].seq.len()));
