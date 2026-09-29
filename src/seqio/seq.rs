@@ -27,7 +27,7 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
 /// multiple lines. Sequences are upper-cased.
 pub struct SeqReader {
     inner: Box<dyn BufRead>,
-    fasta: bool,
+    is_fasta: bool,
     pending: Option<String>, // one-line lookahead (needed for multi-line FASTA)
     buf: String,
 }
@@ -35,8 +35,8 @@ pub struct SeqReader {
 impl SeqReader {
     pub fn open(path: &str) -> Self {
         let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
-        let gz = path.ends_with(".gz") || path.ends_with(".bgz");
-        let mut inner: Box<dyn BufRead> = if gz {
+        let is_gzip = path.ends_with(".gz") || path.ends_with(".bgz");
+        let mut inner: Box<dyn BufRead> = if is_gzip {
             Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
         } else {
             Box::new(BufReader::with_capacity(1 << 20, file))
@@ -52,13 +52,13 @@ impl SeqReader {
                 break;
             }
         }
-        let fasta = first.starts_with('>');
+        let is_fasta = first.starts_with('>');
         let pending = if first.is_empty() { None } else { Some(first) };
-        SeqReader { inner, fasta, pending, buf: String::new() }
+        SeqReader { inner, is_fasta, pending, buf: String::new() }
     }
 
     /// Read the next line, consuming the lookahead if present.
-    fn read_line(&mut self) -> Option<String> {
+    fn next_line(&mut self) -> Option<String> {
         if let Some(p) = self.pending.take() {
             return Some(p);
         }
@@ -73,14 +73,14 @@ impl SeqReader {
 impl Iterator for SeqReader {
     type Item = (String, Vec<u8>);
     fn next(&mut self) -> Option<(String, Vec<u8>)> {
-        if self.fasta {
+        if self.is_fasta {
             // header (skip blanks)
             let header = loop {
-                let l = self.read_line()?;
-                if l.trim().is_empty() {
+                let line = self.next_line()?;
+                if line.trim().is_empty() {
                     continue;
                 }
-                break l;
+                break line;
             };
             if !header.starts_with('>') {
                 return None;
@@ -89,7 +89,7 @@ impl Iterator for SeqReader {
             // sequence lines until next '>' or EOF
             let mut seq: Vec<u8> = Vec::new();
             loop {
-                let line = match self.read_line() {
+                let line = match self.next_line() {
                     Some(l) => l,
                     None => break,
                 };
@@ -102,16 +102,16 @@ impl Iterator for SeqReader {
             Some((name, seq))
         } else {
             // FASTQ: @header / seq / + / qual
-            let header = self.read_line()?;
+            let header = self.next_line()?;
             if !header.starts_with('@') {
                 return None;
             }
             let name = header[1..].trim_end().split_whitespace().next().unwrap_or("").to_string();
-            let seqline = self.read_line()?;
+            let seq_line = self.next_line()?;
             let seq: Vec<u8> =
-                seqline.trim_end().as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect();
-            let _plus = self.read_line()?;
-            let _qual = self.read_line()?;
+                seq_line.trim_end().as_bytes().iter().map(|b| b.to_ascii_uppercase()).collect();
+            let _plus = self.next_line()?;
+            let _qual = self.next_line()?;
             Some((name, seq))
         }
     }

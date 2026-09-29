@@ -1,12 +1,12 @@
 # lcpsynciso
 
 Cluster long transcript reads (PacBio HiFi or ONT) by shared LCP-syncmer seeds, then
-resolve the isoforms within each cluster and build a consensus sequence for each. One
+detect the isoforms within each cluster and build a consensus sequence for each. One
 binary, pure Rust, no external tools.
 
 | Command | What it does |
 |---|---|
-| `predict` | Clusters the reads and resolves isoforms in a single run. The input file is read once and held in memory, 2-bit packed. |
+| `predict` | Clusters the reads and detects isoforms in a single run. The input file is read once and held in memory, 2-bit packed. |
 | `cluster` | Clustering only. |
 | `find-isoforms` | Isoforms for an existing cluster assignment. The reads file does not need to be sorted by cluster. Single-threaded. |
 
@@ -51,7 +51,7 @@ thresholds differ: `--min-shared` is 3 for `predict` and 8 for `cluster`, and
 |---|---|
 | `isoform_assignments.tsv` | read_name, cluster_id, isoform_id (with a header row) |
 | `isoform_summary.tsv` | cluster_id, isoform_id, n_reads, length (with a header row) |
-| `isoforms.fasta` | consensus sequence per isoform; the longest member read with `--no-consensus` |
+| `isoforms.fasta` | consensus sequence per isoform |
 
 Not every read is assigned. A read is left out of `isoform_assignments.tsv` if its group
 has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluster is
@@ -86,9 +86,7 @@ first.
    beyond the first and last anchor. A read is rejected if the sequences diverge, a gap
    holds one long indel (such as an exon or retained intron), or too little of the read
    is matched. Rejected reads seed later groups.
-2. **Split on a recurrent indel** (`--min-variant-frac`, off by default): isoforms that
-   differ by a few bases, such as a shifted splice site, share the same indel position.
-3. **Split by read ends.** Reads that share a start peak and an end peak form an isoform
+2. **Split by read ends.** Reads that share a start peak and an end peak form an isoform
    if there are at least `--min-iso` of them. Other reads join the best-supported isoform
    that contains them, or are dropped. Groups smaller than `--min-iso` are dropped.
    `--start-split` sets how starts count. In cDNA most reads are 5'-truncated, so start
@@ -99,12 +97,12 @@ first.
    its reads as an isoform of its own, beside the full-length one. In capped cDNA (template
    switching) that means most of its reads carry an untemplated 5' G; without that signal
    (direct RNA, spike-ins), a sharp peak.
-4. **Consensus.** The longest read is cut into windows at minimizers carried by a majority
+3. **Consensus.** The longest read is cut into windows at minimizers carried by a majority
    of the reads covering that position (at least 2); each window takes the most frequent
    read substring. Where fewer than 3 of the isoform's own reads cover a position, the other
    reads of its structure group (same exons, other ends) vote too. No multiple alignment is
    needed.
-5. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
+4. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
    the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
    past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
 
@@ -123,23 +121,22 @@ first.
 src/
   main.rs         subcommand dispatch
   lib.rs          library root
-  pipeline/       predict
+  predict/        predict
   cluster/        cluster, plus the seed counting and greedy clustering predict uses
-  isoform/        isoform resolution and find-isoforms
-    mod.rs          overview of the five steps
+  isoform/        isoform detection and find-isoforms
+    mod.rs          overview of the four steps
     fit.rs          step 1: does a read match the backbone
-    variant.rs      step 2: recurrent-indel split
-    ends.rs         step 3: split by read ends
-    consensus.rs    step 4: consensus
-    collapse.rs     step 5: merge duplicates
+    ends.rs         step 2: split by read ends
+    consensus.rs    step 3: consensus
+    collapse.rs     step 4: merge duplicates
     anchors.rs      minimizers and anchor chaining
-    ba.rs           block-aligner calls
+    align.rs        block-aligner calls
     options.rs      settings, defaults, shared flags and help
     output.rs       output files
     stats.rs        diagnostic counters
-    cli.rs          find-isoforms
+    find_isoforms.rs find-isoforms
   seeds/          LCP-syncmer seeds (from synpact)
-  io/             FASTA/FASTQ reader
-  seqstore.rs     2-bit packed read store
-  hashmap.rs      map keyed by seed hashes
+  seqio/          FASTA/FASTQ reader
+  read_store.rs   2-bit packed read store
+  seedmap.rs      map keyed by seed hashes
 ```

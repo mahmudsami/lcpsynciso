@@ -11,29 +11,44 @@ use std::io::{BufWriter, Write};
 
 use super::{Isoform, Read};
 
-/// One cluster's records, rendered in memory so they can be built on a worker thread.
-pub(crate) struct Rendered {
+/// One cluster's records, formatted in memory so they can be built on a worker thread.
+pub(crate) struct ClusterRecords {
     assignments: Vec<u8>,
     summary: Vec<u8>,
     fasta: Vec<u8>,
 }
 
-/// Render the records for `isos`, the isoforms of cluster `cid`, whose members index `reads`.
-pub(crate) fn render(cid: u32, reads: &[Read], isos: &[Isoform]) -> Rendered {
-    let mut r = Rendered { assignments: Vec::new(), summary: Vec::new(), fasta: Vec::new() };
-    for (k, iso) in isos.iter().enumerate() {
-        let iso_id = format!("{cid}.{k}");
-        writeln!(r.summary, "{cid}\t{iso_id}\t{}\t{}", iso.members.len(), iso.consensus.len())
-            .unwrap();
-        writeln!(r.fasta, ">{iso_id} reads={} len={}", iso.members.len(), iso.consensus.len())
-            .unwrap();
-        r.fasta.extend_from_slice(&iso.consensus);
-        r.fasta.push(b'\n');
-        for &ri in &iso.members {
-            writeln!(r.assignments, "{}\t{cid}\t{iso_id}", reads[ri].name).unwrap();
+/// Format the records for `isoforms`, the isoforms of cluster `cid`, whose members index `reads`.
+pub(crate) fn format_cluster_records(
+    cid: u32,
+    reads: &[Read],
+    isoforms: &[Isoform],
+) -> ClusterRecords {
+    let mut records =
+        ClusterRecords { assignments: Vec::new(), summary: Vec::new(), fasta: Vec::new() };
+    for (isoform_index, isoform) in isoforms.iter().enumerate() {
+        let isoform_id = format!("{cid}.{isoform_index}");
+        writeln!(
+            records.summary,
+            "{cid}\t{isoform_id}\t{}\t{}",
+            isoform.members.len(),
+            isoform.consensus.len()
+        )
+        .unwrap();
+        writeln!(
+            records.fasta,
+            ">{isoform_id} reads={} len={}",
+            isoform.members.len(),
+            isoform.consensus.len()
+        )
+        .unwrap();
+        records.fasta.extend_from_slice(&isoform.consensus);
+        records.fasta.push(b'\n');
+        for &read_idx in &isoform.members {
+            writeln!(records.assignments, "{}\t{cid}\t{isoform_id}", reads[read_idx].name).unwrap();
         }
     }
-    r
+    records
 }
 
 pub(crate) struct OutputFiles {
@@ -57,10 +72,10 @@ impl OutputFiles {
         files
     }
 
-    pub(crate) fn append(&mut self, r: &Rendered) {
-        self.assignments.write_all(&r.assignments).unwrap();
-        self.summary.write_all(&r.summary).unwrap();
-        self.fasta.write_all(&r.fasta).unwrap();
+    pub(crate) fn append(&mut self, records: &ClusterRecords) {
+        self.assignments.write_all(&records.assignments).unwrap();
+        self.summary.write_all(&records.summary).unwrap();
+        self.fasta.write_all(&records.fasta).unwrap();
     }
 
     pub(crate) fn flush(&mut self) {

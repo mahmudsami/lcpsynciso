@@ -1,11 +1,11 @@
 //! lcpsynciso command line: dispatch to the `predict`, `cluster` and `find-isoforms`
 //! subcommands.
 
-use lcpsynciso::{cluster, isoform, pipeline};
+use lcpsynciso::{cluster, isoform, predict};
 
-fn usage() {
+fn print_usage() {
     eprintln!(
-        "lcpsynciso — cluster long reads by shared LCP-syncmer seeds, then resolve isoforms
+        "lcpsynciso — cluster long reads by shared LCP-syncmer seeds, then detect isoforms
 
 USAGE:
     lcpsynciso <command> [options]
@@ -24,21 +24,21 @@ fn main() {
     let cmd = match argv.first() {
         Some(c) => c.as_str(),
         None => {
-            usage();
+            print_usage();
             std::process::exit(2);
         }
     };
     let rest = &argv[1..];
     match cmd {
-        "predict" => pipeline::run(pipeline::parse_args(rest)),
+        "predict" => predict::run(predict::parse_args(rest)),
         "cluster" => cluster::run(cluster::parse_args(rest)),
         "find-isoforms" | "isoforms" | "isofinder" => {
             isoform::run(isoform::parse_args(rest))
         }
-        "-h" | "--help" => usage(),
+        "-h" | "--help" => print_usage(),
         other => {
             eprintln!("unknown command: {other}\n");
-            usage();
+            print_usage();
             std::process::exit(2);
         }
     }
