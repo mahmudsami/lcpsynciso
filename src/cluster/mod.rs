@@ -1,10 +1,10 @@
 //! Greedy single-pass clustering of reads by shared seeds: the `cluster` subcommand, and
-//! the building blocks `predict` uses for its phases A and B.
+//! the phases A and B that `predict` shares with it.
 //!
 //! Seeds are synpact's LCP block hashes from levels L1..L`levels`. Only mid-frequency seeds
 //! are informative: found in at least `min_occ` reads (shared) and at most `max_occ`
-//! (not a repeat). Reads are then clustered one at a time, in file order here and longest
-//! first in `predict`:
+//! (not a repeat). Reads are then clustered one at a time, longest first (ties in file
+//! order), so each cluster is seeded by its most complete read:
 //!
 //!   for each read:
 //!     each informative seed already claimed by a cluster votes for that cluster,
@@ -17,18 +17,23 @@
 //! A read of the same gene shares most of its seeds with that gene's cluster; a read of
 //! another gene may share a few by chance, such as a repeat in its UTR. The fraction keeps
 //! those few from merging unrelated genes, which a fixed `min_shared` cannot do for long
-//! reads without also splitting reads that have few seeds.
+//! reads without also splitting reads that have few seeds. Longest-first order needs it,
+//! because the longest reads start clusters first.
 //!
-//! The subcommand reads the file twice: pass 1 counts seed frequencies, pass 2 assigns.
+//! The file is read once. Phase A (`load_reads`) packs every read into a [`ReadStore`]
+//! while counting how many reads contain each seed; phase B (`cluster_reads`) clusters the
+//! stored reads. The `cluster` subcommand stops there; `predict` goes on to detect isoforms.
 //! Seeds are computed in parallel per batch; assignment is sequential because it depends on
 //! read order.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufWriter, Write};
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::read_store::ReadStore;
 use crate::seedmap::{new_seed_map, SeedMap};
 use crate::seqio::SeqReader;
 use crate::seeds::read_seed_levels;
@@ -166,10 +171,147 @@ impl GreedyClusterer {
     pub(crate) fn n_clusters(&self) -> usize {
         self.cluster_sizes.len()
     }
+}
 
-    pub(crate) fn cluster_sizes(&self) -> &[u32] {
-        &self.cluster_sizes
+// ── Phases A and B, shared by `cluster` and `predict` ────────────────────────
+
+/// Phase A: pack every read into a [`ReadStore`] while counting seeds, a batch at a time.
+/// `command` names the subcommand in progress messages. Also returns the time spent reading,
+/// counting, and packing.
+pub(crate) fn load_reads(
+    reads_path: &str,
+    batch_size: usize,
+    max_reads: usize,
+    seed_params: SeedParams,
+    command: &str,
+) -> (ReadStore, SeedCounts, [Duration; 3]) {
+    let mut store = ReadStore::default();
+    let mut counts: SeedCounts = new_seed_map();
+    let (mut d_read, mut d_seed, mut d_pack) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut reader = SeqReader::open(reads_path);
+    let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(batch_size);
+    loop {
+        batch.clear();
+        let remaining = max_reads.saturating_sub(store.len());
+        if remaining == 0 {
+            break;
+        }
+        let want = batch_size.min(remaining);
+        let lap_start = Instant::now();
+        while batch.len() < want {
+            match reader.next() {
+                Some(record) => batch.push(record),
+                None => break,
+            }
+        }
+        d_read += lap_start.elapsed();
+        if batch.is_empty() {
+            break;
+        }
+
+        let lap_start = Instant::now();
+        let part = count_seeds(batch.par_iter().map(|(_, seq)| seq.as_slice()), seed_params);
+        merge_seed_counts(&mut counts, part);
+        d_seed += lap_start.elapsed();
+
+        let lap_start = Instant::now();
+        for (name, seq) in batch.drain(..) {
+            store.push(name, &seq);
+        }
+        d_pack += lap_start.elapsed();
+        eprintln!("[{command}]   phase A {} reads ...", store.len());
     }
+    (store, counts, [d_read, d_seed, d_pack])
+}
+
+/// The clustering order: longest read first, ties in file order. A counting sort over read
+/// lengths, so visiting the reads in file order yields each one's rank without storing a
+/// read -> rank table.
+struct LengthRanks {
+    /// Read length -> rank of the next read of that length.
+    next: BTreeMap<usize, u32>,
+}
+
+impl LengthRanks {
+    fn new(store: &ReadStore) -> Self {
+        let mut next: BTreeMap<usize, u32> = BTreeMap::new();
+        for read_idx in 0..store.len() {
+            *next.entry(store.read_len(read_idx)).or_insert(0) += 1;
+        }
+        // Counts -> first rank of each length, longest first.
+        let mut rank = 0u32;
+        for c in next.values_mut().rev() {
+            let count = *c;
+            *c = rank;
+            rank += count;
+        }
+        LengthRanks { next }
+    }
+
+    /// Rank of the next read of length `len`, visiting reads in file order.
+    fn rank(&mut self, len: usize) -> usize {
+        let r = self.next.get_mut(&len).expect("length counted in LengthRanks::new");
+        *r += 1;
+        (*r - 1) as usize
+    }
+}
+
+/// Phase B: cluster the stored reads with `clusterer`, longest first, and return each
+/// cluster's member read indices in file order. Seeds are computed in parallel per batch;
+/// assignment is sequential. `command` names the subcommand in progress messages.
+///
+/// The reads stay where they are in the store. One `u32` per read, `slot`, first holds the
+/// read at each rank, then, once that read is assigned, its cluster id. So sorting costs
+/// no memory beyond the per-read cluster id that clustering needs anyway.
+pub(crate) fn cluster_reads(
+    store: &ReadStore,
+    seed_params: SeedParams,
+    informative: SeedMap<u8>,
+    level_weights: &[u32],
+    mut clusterer: GreedyClusterer,
+    batch_size: usize,
+    command: &str,
+) -> Vec<Vec<u32>> {
+    let n_reads = store.len();
+    let mut slot: Vec<u32> = vec![0; n_reads];
+    let mut ranks = LengthRanks::new(store);
+    for read_idx in 0..n_reads {
+        slot[ranks.rank(store.read_len(read_idx))] = read_idx as u32;
+    }
+
+    let mut start = 0;
+    while start < n_reads {
+        let end = (start + batch_size).min(n_reads);
+        let seeds: Vec<Vec<(u64, u32)>> = slot[start..end]
+            .par_iter()
+            .map(|&read_idx| {
+                weighted_seeds(
+                    &store.read_seq(read_idx as usize),
+                    seed_params,
+                    &informative,
+                    level_weights,
+                )
+            })
+            .collect();
+        for (offset, read_seeds) in seeds.iter().enumerate() {
+            slot[start + offset] = clusterer.assign(read_seeds);
+        }
+        eprintln!("[{command}]   phase B {} reads, {} clusters ...", end, clusterer.n_clusters());
+        start = end;
+    }
+    let n_clusters = clusterer.n_clusters();
+    // Free the seed tables before building the member lists.
+    drop(clusterer);
+    drop(informative);
+
+    // Replay the ranks in file order to map each read to its cluster id.
+    let mut ranks = LengthRanks::new(store);
+    let mut cluster_members: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
+    for read_idx in 0..n_reads {
+        let c = slot[ranks.rank(store.read_len(read_idx))];
+        cluster_members[c as usize].push(read_idx as u32);
+    }
+    cluster_members
 }
 
 // ── The `cluster` subcommand ─────────────────────────────────────────────────
@@ -205,9 +347,8 @@ impl Default for Config {
             levels: 3,
             min_occ: 2,
             max_occ: 100_000,
-            min_shared: 8,
-            // Off: in file order with min_shared 8 it only trades merges for splits.
-            min_shared_frac: 0.0,
+            min_shared: 3,
+            min_shared_frac: 0.10,
             level_weights: vec![1, 2, 5],
             batch_size: 500_000,
             max_reads: usize::MAX,
@@ -275,6 +416,7 @@ pub fn parse_args(argv: &[String]) -> Config {
 pub fn print_usage() {
     eprintln!(
         "lcpsynciso cluster — greedy clustering of reads by shared, level-weighted seeds
+(longest read first; the file is read once and the reads are held in RAM, 2-bit packed)
 
 USAGE:
     lcpsynciso cluster <reads.fq[.gz]|.fa[.gz]> [options]
@@ -286,8 +428,8 @@ OPTIONS:
     --min-occ N      keep seed if it occurs in >= N reads      [2]
     --max-occ N      ... and in <= N reads                     [100000]
     --level-weights a,b,c   per-level vote weights (L1,L2,..)  [1,2,5]
-    --min-shared N   join a cluster if weighted shared >= N    [8]
-    --min-shared-frac F  ... and >= F of the read's seed weight [0 = off]
+    --min-shared N   join a cluster if weighted shared >= N    [3]
+    --min-shared-frac F  ... and >= F of the read's seed weight [0.1]
     --batch N        reads per batch                           [500000]
     --max-reads N    stop after N reads                        [all]
     --threads N      worker threads (0 = all)                  [0]
@@ -303,43 +445,14 @@ pub fn run(config: Config) {
     let params =
         SeedParams { k: config.seed_k, s: config.seed_s, t: config.seed_t, levels: config.levels };
 
-    // ── Pass 1: seed frequencies ──
+    // ── Phase A: read, pack, count seeds ──
     eprintln!(
-        "[cluster] pass 1: counting seed frequencies (k={} s={} L1..{}) ...",
-        config.seed_k, config.seed_s, config.levels
+        "[cluster] phase A: reading {} once (pack + seed frequencies; k={} s={} L1..{}) ...",
+        config.reads_path, config.seed_k, config.seed_s, config.levels
     );
-    let mut counts: SeedCounts = new_seed_map();
-    let mut n_reads: u64 = 0;
-    {
-        let mut reader = SeqReader::open(&config.reads_path);
-        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(config.batch_size);
-        let mut done = false;
-        while !done {
-            batch.clear();
-            while batch.len() < config.batch_size {
-                match reader.next() {
-                    Some((_, seq)) => {
-                        batch.push(seq);
-                        n_reads += 1;
-                        if n_reads as usize >= config.max_reads {
-                            done = true;
-                            break;
-                        }
-                    }
-                    None => {
-                        done = true;
-                        break;
-                    }
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            let part = count_seeds(batch.par_iter().map(|seq| seq.as_slice()), params);
-            merge_seed_counts(&mut counts, part);
-            eprintln!("[cluster]   pass1 {} reads ...", n_reads);
-        }
-    }
+    let (store, counts, _) =
+        load_reads(&config.reads_path, config.batch_size, config.max_reads, params, "cluster");
+    let n_reads = store.len() as u64;
     let n_distinct_seeds = counts.len();
     let informative = informative_seeds(&counts, config.min_occ, config.max_occ);
     drop(counts);
@@ -349,74 +462,46 @@ pub fn run(config: Config) {
         config.min_occ, config.max_occ
     );
 
-    // ── Pass 2: greedy assignment ──
+    // ── Phase B: greedy clustering, longest read first ──
     eprintln!(
-        "[cluster] pass 2: greedy clustering (weights={:?}, min-shared={}, min-shared-frac={}) ...",
+        "[cluster] phase B: greedy clustering (weights={:?}, min-shared={}, min-shared-frac={}) ...",
         config.level_weights, config.min_shared, config.min_shared_frac
     );
-    let mut clusterer = GreedyClusterer::new(config.min_shared, config.min_shared_frac);
-
-    fs::create_dir_all(&config.out_dir).expect("mkdir out");
-    let mut assignments_writer = if config.emit_assignments {
-        let mut w = BufWriter::new(
-            fs::File::create(format!("{}/assignments.tsv", config.out_dir))
-                .expect("create assignments.tsv"),
-        );
-        writeln!(w, "read_name\tcluster_id").unwrap();
-        Some(w)
-    } else {
-        None
-    };
-
-    let mut reader = SeqReader::open(&config.reads_path);
-    let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(config.batch_size);
-    let mut seen: u64 = 0;
-    let mut done = false;
-    while !done {
-        batch.clear();
-        while batch.len() < config.batch_size {
-            match reader.next() {
-                Some(record) => {
-                    batch.push(record);
-                    seen += 1;
-                    if seen as usize >= config.max_reads {
-                        done = true;
-                        break;
-                    }
-                }
-                None => {
-                    done = true;
-                    break;
-                }
-            }
-        }
-        if batch.is_empty() {
-            break;
-        }
-
-        let seeds: Vec<Vec<(u64, u32)>> = batch
-            .par_iter()
-            .map(|(_, seq)| weighted_seeds(seq, params, &informative, &config.level_weights))
-            .collect();
-        for (i, read_seeds) in seeds.iter().enumerate() {
-            let cid = clusterer.assign(read_seeds);
-            if let Some(w) = assignments_writer.as_mut() {
-                writeln!(w, "{}\t{}", batch[i].0, cid).unwrap();
-            }
-        }
-        eprintln!("[cluster]   pass2 {} reads, {} clusters ...", seen, clusterer.n_clusters());
-    }
-    if let Some(mut w) = assignments_writer {
-        w.flush().unwrap();
-    }
-
-    write_outputs(
-        &config,
-        n_reads,
-        clusterer.cluster_sizes(),
-        n_distinct_seeds,
-        n_informative_seeds,
+    let clusterer = GreedyClusterer::new(config.min_shared, config.min_shared_frac);
+    let cluster_members = cluster_reads(
+        &store,
+        params,
+        informative,
+        &config.level_weights,
+        clusterer,
+        config.batch_size,
+        "cluster",
     );
+
+    if config.emit_assignments {
+        write_assignments(&config.out_dir, &store, &cluster_members);
+    }
+    let cluster_sizes: Vec<u32> = cluster_members.iter().map(|m| m.len() as u32).collect();
+    write_outputs(&config, n_reads, &cluster_sizes, n_distinct_seeds, n_informative_seeds);
+}
+
+/// Write `assignments.tsv`: every read's cluster, in file order.
+fn write_assignments(dir: &str, store: &ReadStore, cluster_members: &[Vec<u32>]) {
+    let mut cluster_of: Vec<u32> = vec![0; store.len()];
+    for (cid, member_indices) in cluster_members.iter().enumerate() {
+        for &read_idx in member_indices {
+            cluster_of[read_idx as usize] = cid as u32;
+        }
+    }
+    fs::create_dir_all(dir).expect("mkdir out");
+    let mut w = BufWriter::new(
+        fs::File::create(format!("{dir}/assignments.tsv")).expect("create assignments.tsv"),
+    );
+    writeln!(w, "read_name\tcluster_id").unwrap();
+    for (read_idx, cid) in cluster_of.iter().enumerate() {
+        writeln!(w, "{}\t{cid}", store.read_name(read_idx)).unwrap();
+    }
+    w.flush().unwrap();
 }
 
 /// Write summary.tsv and cluster_size_hist.tsv, and print a summary to stdout.
@@ -525,7 +610,23 @@ fn write_outputs(
 
 #[cfg(test)]
 mod tests {
-    use super::GreedyClusterer;
+    use rayon::prelude::*;
+
+    use super::{
+        cluster_reads, count_seeds, informative_seeds, GreedyClusterer, LengthRanks, SeedParams,
+    };
+    use crate::read_store::ReadStore;
+
+    /// A fixed pseudo-random sequence, so seeds are unique and well spread.
+    fn random_seq(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                b"ACGT"[(x >> 33) as usize % 4]
+            })
+            .collect()
+    }
 
     /// Twenty unit-weight seeds, the first `shared` of which the first read also has.
     fn read(shared: u64) -> Vec<(u64, u32)> {
@@ -540,5 +641,54 @@ mod tests {
             assert_eq!(c.assign(&read(20)), 0);
             assert_eq!(c.assign(&read(shared)) == 0, joins, "frac={frac} shared={shared}");
         }
+    }
+
+    #[test]
+    fn length_ranks_put_the_longest_first_and_keep_file_order_among_equals() {
+        let mut store = ReadStore::default();
+        for (i, len) in [5usize, 9, 5, 9, 7].into_iter().enumerate() {
+            store.push(format!("r{i}"), &vec![b'A'; len]);
+        }
+        let mut ranks = LengthRanks::new(&store);
+        let ranked: Vec<usize> = (0..store.len()).map(|i| ranks.rank(store.read_len(i))).collect();
+        // Lengths 9, 9, 7, 5, 5 take ranks 0..5; equal lengths keep file order.
+        assert_eq!(ranked, vec![3, 0, 4, 1, 2]);
+    }
+
+    #[test]
+    fn the_longest_read_seeds_the_first_cluster_wherever_it_sits_in_the_file() {
+        // Two genes, three overlapping copies each. The longest read of all, the full-length
+        // copy of gene 2, is last in the file, so cluster 0 belongs to gene 2 only if the
+        // reads are clustered longest first; in file order it would belong to gene 1.
+        let gene1 = random_seq(1200, 1);
+        let gene2 = random_seq(1800, 2);
+        let seqs = vec![
+            gene1.clone(),
+            gene1[100..].to_vec(),
+            gene1[200..].to_vec(),
+            gene2[300..].to_vec(),
+            gene2[600..].to_vec(),
+            gene2.clone(),
+        ];
+        let mut store = ReadStore::default();
+        for (i, seq) in seqs.iter().enumerate() {
+            store.push(format!("r{i}"), seq);
+        }
+        let params = SeedParams { k: 15, s: 9, t: 3, levels: 3 };
+        let counts = count_seeds(seqs.par_iter().map(|seq| seq.as_slice()), params);
+        let informative = informative_seeds(&counts, 2, 100_000);
+
+        // A batch size of 4 splits the six reads over two batches.
+        let clusters = cluster_reads(
+            &store,
+            params,
+            informative,
+            &[1, 2, 5],
+            GreedyClusterer::new(3, 0.1),
+            4,
+            "test",
+        );
+        // Members are listed in file order.
+        assert_eq!(clusters, vec![vec![3, 4, 5], vec![0, 1, 2]]);
     }
 }

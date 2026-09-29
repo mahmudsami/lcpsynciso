@@ -125,7 +125,7 @@ pub(crate) fn print_report() {
         N_GAPS_ACCEPTED.load(Relaxed)
     );
     eprintln!(
-        "[predict] === split_by_ends routes: dense-cell={}  enclosure-fold={}  dropped={}  | folds WIDER than target extent={} ===",
+        "[predict] === split_by_ends routes: dense-cell={}  enclosure-fold={}  dropped={}  | folds WIDER than isoform extent={} ===",
         N_DENSE.load(Relaxed),
         N_ENCLOSED.load(Relaxed),
         N_DROP.load(Relaxed),

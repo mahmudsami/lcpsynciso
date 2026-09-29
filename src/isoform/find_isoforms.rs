@@ -147,7 +147,7 @@ pub fn run(config: Config) {
     );
 
     let only: HashSet<u32> = config.only_clusters.iter().copied().collect();
-    let is_target = |cid: u32| {
+    let is_eligible = |cid: u32| {
         (only.is_empty() || only.contains(&cid))
             && cluster_size
                 .get(&cid)
@@ -158,11 +158,12 @@ pub fn run(config: Config) {
     // First-fit decreasing on cluster size: a cluster never spans two passes, and each pass
     // holds at most `budget` reads unless a single cluster is bigger than that.
     let budget = config.max_buffer_reads.max(1);
-    let mut targets: Vec<u32> = cluster_size.keys().copied().filter(|&c| is_target(c)).collect();
-    targets.sort_by_key(|c| Reverse(cluster_size[c]));
+    let mut eligible_clusters: Vec<u32> =
+        cluster_size.keys().copied().filter(|&c| is_eligible(c)).collect();
+    eligible_clusters.sort_by_key(|c| Reverse(cluster_size[c]));
     let mut pass_of: HashMap<u32, usize> = HashMap::new();
     let mut pass_load: Vec<usize> = Vec::new();
-    for &c in &targets {
+    for &c in &eligible_clusters {
         let sz = cluster_size[&c];
         let pass = pass_load.iter().position(|&load| load + sz <= budget).unwrap_or_else(|| {
             pass_load.push(0);
@@ -173,8 +174,8 @@ pub fn run(config: Config) {
     }
     let n_passes = pass_load.len().max(1);
     eprintln!(
-        "[find-isoforms] {} target clusters -> {} streaming pass(es) over {} (<= {} reads/pass) ...",
-        targets.len(),
+        "[find-isoforms] {} eligible clusters -> {} streaming pass(es) over {} (<= {} reads/pass) ...",
+        eligible_clusters.len(),
         n_passes,
         config.reads_path,
         budget
