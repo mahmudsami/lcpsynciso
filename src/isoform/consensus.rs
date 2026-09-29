@@ -1,4 +1,4 @@
-//! Step 4: consensus per isoform, from anchor-windowed modal segments.
+//! Step 3: consensus per isoform, from anchor-windowed modal segments.
 //!
 //! The reads of one isoform are near-identical and collinear (that is exactly
 //! why they were grouped). So instead of a multiple-sequence alignment / POA we

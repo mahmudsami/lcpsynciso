@@ -30,50 +30,35 @@ pub struct Cfg {
     /// A gap between consecutive anchors longer than this (bp) is aligned; shorter gaps are
     /// accepted as sequencing error.
     pub max_gap: u32,
-    /// Minimum identity Eq/(Eq+X) of an aligned gap, indel columns excluded. 0 disables.
+    /// Minimum identity Eq/(Eq+X) of an aligned gap, indel columns excluded.
     pub min_gap_ident: f64,
     /// An indel of at least this many bp in an aligned gap is extra sequence, not error.
-    /// 0 disables.
     pub max_indel_run: u32,
     /// Unmatched flank (bp) that means a different structure: at one end if the sequences
     /// diverge there, at both ends if the read merely overhangs the backbone.
     pub max_flank: u32,
-    /// Treat a homopolymer (polyA) overhang as library artifact: it is not counted as an
-    /// unmatched flank or against `min_cov`, and does not extend the read's endpoint.
-    pub polya_clamp: bool,
 
-    // Step 2: split on a recurrent indel. (`variant.rs`)
-    /// Fraction of a group that must share one indel at one position to split it. 0 disables.
-    pub min_variant_frac: f64,
-
-    // Step 3: split by read ends. (`ends.rs`)
+    // Step 2: split by read ends. (`ends.rs`)
     /// Whether read starts split a group as well as read ends. In cDNA most reads are
     /// 5'-truncated, so most start peaks mark truncation, not transcription start sites.
     pub start_split: StartSplit,
-    /// Group read ends by the peaks they form; false uses a fixed `boundary_tol` grid.
-    pub end_modes: bool,
     /// Window (bp) used to find end peaks.
     pub peak_width: u32,
     /// How far (bp) a read end may sit from its peak, and the slack when folding a partial
-    /// read into an isoform. The grid cell size when `end_modes` is off.
+    /// read into an isoform.
     pub boundary_tol: u32,
 
-    // Step 4: isoforms.
-    /// Minimum reads for an isoform, and for an end peak or either side of a variant split.
+    // Step 3: isoforms.
+    /// Minimum reads for an isoform, and for an end peak.
     pub min_iso: usize,
-    /// Build a consensus per isoform; false emits the longest member read instead.
-    pub consensus: bool,
 
-    // Step 5: merge duplicates. (`collapse.rs`)
-    /// Merge near-identical isoforms.
-    pub collapse: bool,
+    // Step 4: merge duplicates. (`collapse.rs`)
     /// Largest gap, indel or length difference (bp) between two isoforms that still merge.
     pub collapse_gap: u32,
     /// Merge by containment only if the smaller isoform has <= this fraction of the larger's
     /// reads.
     pub collapse_ratio: f64,
     /// Consensus identity at which two isoforms merge regardless of `collapse_ratio`.
-    /// 0 disables.
     pub collapse_ident: f64,
 }
 
@@ -88,15 +73,10 @@ impl Default for Cfg {
             min_gap_ident: 0.80,
             max_indel_run: 4,
             max_flank: 25,
-            polya_clamp: true,
-            min_variant_frac: 0.0,
             start_split: StartSplit::On,
-            end_modes: true,
             peak_width: 10,
             boundary_tol: 150,
             min_iso: 3,
-            consensus: true,
-            collapse: true,
             collapse_gap: 3,
             collapse_ratio: 0.5,
             collapse_ident: 0.98,
@@ -105,7 +85,7 @@ impl Default for Cfg {
 }
 
 /// Apply `flag`, if it is one of the shared isoform flags, taking its value from `next`.
-/// Returns false for any other flag. The minimizer k/w and consensus flags are named
+/// Returns false for any other flag. The minimizer k/w flags are named
 /// differently per subcommand, so each parses those itself.
 pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> String) -> bool {
     match flag {
@@ -115,9 +95,6 @@ pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> St
         "--min-gap-ident" => cfg.min_gap_ident = next().parse().unwrap(),
         "--max-indel-run" => cfg.max_indel_run = next().parse().unwrap(),
         "--max-flank" => cfg.max_flank = next().parse().unwrap(),
-        "--polya-clamp" => cfg.polya_clamp = true,
-        "--no-polya-clamp" => cfg.polya_clamp = false,
-        "--min-variant-frac" => cfg.min_variant_frac = next().parse().unwrap(),
         "--start-split" => {
             cfg.start_split = match next().as_str() {
                 "on" => StartSplit::On,
@@ -131,12 +108,9 @@ pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> St
         }
         "--split-starts" => cfg.start_split = StartSplit::On,
         "--no-split-starts" => cfg.start_split = StartSplit::Off,
-        "--end-modes" => cfg.end_modes = true,
-        "--no-end-modes" => cfg.end_modes = false,
         "--peak-width" => cfg.peak_width = next().parse().unwrap(),
         "--boundary-tol" => cfg.boundary_tol = next().parse().unwrap(),
         "--min-iso" => cfg.min_iso = next().parse().unwrap(),
-        "--no-collapse" => cfg.collapse = false,
         "--collapse-gap" => cfg.collapse_gap = next().parse().unwrap(),
         "--collapse-ratio" => cfg.collapse_ratio = next().parse().unwrap(),
         "--collapse-ident" => cfg.collapse_ident = next().parse().unwrap(),
@@ -154,17 +128,12 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
     --max-gap N             gap between anchors (bp) above which it is   [40]
                             aligned; shorter ones count as sequencing error
     --min-gap-ident F       min identity Eq/(Eq+X) of an aligned gap,    [0.80]
-                            indel columns excluded; 0 = off
+                            indel columns excluded
     --max-indel-run N       one indel of >= N bp in an aligned gap is    [4]
-                            extra sequence, not error; 0 = off
+                            extra sequence, not error
     --max-flank N           unmatched read end (bp) meaning a different  [25]
                             structure: one end if the sequences diverge there,
                             both ends if the read only overhangs the longest read
-    --polya-clamp / --no-polya-clamp
-                            ignore homopolymer (polyA) overhang in the   [on]
-                            flank and coverage tests
-    --min-variant-frac F    split a group when >= F of its reads share   [0]
-                            the SAME >=2 bp indel at the SAME position; 0 = off
 
 READ ENDS (a structure group splits into isoforms by where its reads start and end):
     --start-split on|off|auto
@@ -176,19 +145,14 @@ READ ENDS (a structure group splits into isoforms by where its reads start and e
                             untemplated 5' G; otherwise a sharp peak) becomes
                             its own isoform. --split-starts / --no-split-starts
                             are on / off
-    --end-modes / --no-end-modes
-                            group ends by the peaks they form, or on a   [peaks]
-                            fixed --boundary-tol grid
     --peak-width N          window (bp) for finding end peaks; real ends [10]
                             can sit ~20 bp apart
     --boundary-tol N        max bp between a read end and its peak, and  [150]
-                            the slack when folding partial reads into an isoform;
-                            grid cell size with --no-end-modes
+                            the slack when folding partial reads into an isoform
 
 MERGING (near-identical isoforms, after consensus):
-    --no-collapse           keep near-identical isoforms separate
     --collapse-gap N        max gap or length difference (bp) to merge   [3]
     --collapse-ratio F      merge only if the smaller has <= F x the     [0.5]
                             reads of the larger
     --collapse-ident F      consensus identity at which isoforms merge   [0.98]
-                            regardless of --collapse-ratio; 0 = off";
+                            regardless of --collapse-ratio";

@@ -109,7 +109,6 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--max-size" => a.max_size = next().parse().unwrap(),
             "--iso-k" => a.cfg.k = next().parse().unwrap(),
             "--iso-w" => a.cfg.w = next().parse().unwrap(),
-            "--no-consensus" => a.cfg.consensus = false,
             "--dump-clusters" => a.dump_clusters = true,
             "-h" | "--help" => {
                 usage();
@@ -165,7 +164,6 @@ ISOFORMS:
     --min-size N            skip clusters with fewer reads               [1]
     --max-size N            skip clusters with more reads                [all]
     --iso-k N / --iso-w N   isoform minimizer k-mer length / window      [15 / 10]
-    --no-consensus          write each isoform's longest read instead of a consensus
 
 {RESOLVE_HELP}
 

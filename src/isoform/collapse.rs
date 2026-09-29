@@ -1,4 +1,4 @@
-//! Step 5: merge isoforms that turn out to be the same transcript.
+//! Step 4: merge isoforms that turn out to be the same transcript.
 //!
 //! Resolution can split one transcript into several isoforms: reads whose errors break
 //! their anchors fail step 1 and gather in small satellite groups, and a read rejected by
@@ -88,12 +88,8 @@ pub(super) fn collapse(
     for (p, &k) in kept.iter().enumerate() {
         if rebuild[k] {
             let iso = &mut out[p];
-            iso.consensus = if cfg.consensus {
-                consensus::refine_consensus_with_maps(reads, &iso.members, &iso.members, read_maps)
-            } else {
-                let longest = *iso.members.iter().max_by_key(|&&r| reads[r].seq.len()).unwrap();
-                reads[longest].seq.clone()
-            };
+            iso.consensus =
+                consensus::refine_consensus_with_maps(reads, &iso.members, &iso.members, read_maps);
         }
     }
     out
@@ -117,7 +113,7 @@ fn should_merge(
     cfg: &Cfg,
     strict: &Cfg,
 ) -> Merge {
-    if cfg.collapse_ident > 0.0 && same_sequence(small, big, cfg) {
+    if same_sequence(small, big, cfg) {
         return Merge::Yes;
     }
     if small.members.len() as f64 > cfg.collapse_ratio * big.members.len() as f64 {

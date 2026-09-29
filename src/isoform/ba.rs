@@ -6,7 +6,6 @@
 //!     divergence.
 //!   * [`gap_runs`]: global alignment of an interior gap pinned between two anchors, read as
 //!     substitution identity and longest indel.
-//!   * [`indel_profile`]: the indel events of a global alignment, with their positions.
 //!
 //! Buffers are thread-local and reused, since these run millions of times.
 
@@ -132,30 +131,6 @@ fn traced_global<T>(
             let res = blk.res();
             read_trace(blk.trace(), &bf.q, &bf.r, res, cigar)
         })
-    })
-}
-
-/// Fill `out` with the indels of `read` aligned globally to `reference`, as
-/// (position on reference, is insertion, length).
-pub fn indel_profile(read: &[u8], reference: &[u8], out: &mut Vec<(u32, bool, u32)>) {
-    out.clear();
-    if read.is_empty() || reference.is_empty() {
-        return;
-    }
-    traced_global(read, reference, |trace, _, _, res, cigar| {
-        trace.cigar(res.query_idx, res.reference_idx, cigar);
-        let mut pos = 0u32;
-        for i in 0..cigar.len() {
-            let op = cigar.get(i);
-            match op.op {
-                Operation::I => out.push((pos, true, op.len as u32)),
-                Operation::D => {
-                    out.push((pos, false, op.len as u32));
-                    pos += op.len as u32;
-                }
-                _ => pos += op.len as u32,
-            }
-        }
     })
 }
 

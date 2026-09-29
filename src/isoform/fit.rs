@@ -66,7 +66,7 @@ pub(super) fn fits_interval(
         // The read starts before the backbone, unless that overhang is a homopolymer.
         let over = head_read.len().saturating_sub(head.consumed);
         let unmatched = head.unmatched.min(head_read.len());
-        if cfg.polya_clamp && unmatched > 0 && is_homopolymer_tail(&head_read[..unmatched]) {
+        if unmatched > 0 && is_homopolymer_tail(&head_read[..unmatched]) {
             0
         } else {
             -(over as i32)
@@ -85,10 +85,7 @@ pub(super) fn fits_interval(
         // The read ends after the backbone, unless that overhang is a homopolymer.
         let over = tail_read.len().saturating_sub(tail.consumed);
         let unmatched = tail.unmatched.min(tail_read.len());
-        if cfg.polya_clamp
-            && unmatched > 0
-            && is_homopolymer_tail(&tail_read[tail_read.len() - unmatched..])
-        {
+        if unmatched > 0 && is_homopolymer_tail(&tail_read[tail_read.len() - unmatched..]) {
             (tail_bb_start + tail_bb.len()) as i32
         } else {
             (tail_bb_start + tail_bb.len()) as i32 + over as i32
@@ -99,12 +96,10 @@ pub(super) fn fits_interval(
     stats::add_elapsed(&stats::T_FLANK, t_flank);
 
     // ── Decide from the unmatched flanks ──
-    // With the clamp on, a homopolymer overhang never counts as unmatched.
-    let head_poly = cfg.polya_clamp
-        && head.unmatched > 0
+    // A homopolymer overhang never counts as unmatched.
+    let head_poly = head.unmatched > 0
         && is_homopolymer_tail(&head_read[..head.unmatched.min(head_read.len())]);
-    let tail_poly = cfg.polya_clamp
-        && tail.unmatched > 0
+    let tail_poly = tail.unmatched > 0
         && is_homopolymer_tail(&tail_read[tail_read.len() - tail.unmatched.min(tail_read.len())..]);
     let head_long = head.unmatched as u32 > cfg.max_flank && !head_poly;
     let tail_long = tail.unmatched as u32 > cfg.max_flank && !tail_poly;
@@ -150,10 +145,10 @@ fn interior_gaps_match(chain: &[(u32, u32)], read: &[u8], backbone: &[u8], cfg: 
         stats::record_gap_size(gap_len);
         stats::inc(&stats::N_TRACE);
         let gap = ba::gap_runs(&read[r0..r1.max(r0)], &backbone[b0..b1.max(b0)]);
-        if cfg.min_gap_ident > 0.0 && gap.ident() < cfg.min_gap_ident {
+        if gap.ident() < cfg.min_gap_ident {
             return false; // different sequence
         }
-        if cfg.max_indel_run > 0 && gap.max_indel >= cfg.max_indel_run as usize {
+        if gap.max_indel >= cfg.max_indel_run as usize {
             return false; // extra sequence inserted in one piece
         }
         stats::inc(&stats::N_RESCUE);

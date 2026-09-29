@@ -1,10 +1,8 @@
-//! Step 3: split a structure group into isoforms by where its reads start and end.
+//! Step 2: split a structure group into isoforms by where its reads start and end.
 //!
-//! Every read gets a start key and an end key. With `end_modes`, the keys are peaks found in
-//! the reads' start (or end) coordinates: peaks are found with the narrow `peak_width`,
-//! because real boundaries can sit ~20 bp apart, and a read joins the nearest peak within
-//! the wider `boundary_tol`. Without `end_modes`, the keys are cells of a fixed
-//! `boundary_tol` grid.
+//! Every read gets a start key and an end key: the peaks found in the reads' start (or end)
+//! coordinates. Peaks are found with the narrow `peak_width`, because real boundaries can
+//! sit ~20 bp apart, and a read joins the nearest peak within the wider `boundary_tol`.
 //!
 //! A (start, end) key pair held by at least `min_iso` reads is an isoform. Any other read,
 //! typically a truncated copy, joins the best-supported isoform whose extent contains it,
@@ -57,20 +55,13 @@ pub(super) fn split_by_ends(
 ) -> Vec<(Vec<usize>, bool)> {
     let tol = cfg.boundary_tol.max(1) as i32;
 
-    let (mut start_key, end_key): (Vec<Option<i32>>, Vec<Option<i32>>) = if cfg.end_modes {
-        let width = cfg.peak_width.max(1) as i32;
-        let start_peaks = find_peaks(members.iter().map(|m| m.1), width, cfg.min_iso);
-        let end_peaks = find_peaks(members.iter().map(|m| m.2), width, cfg.min_iso);
-        (
-            members.iter().map(|m| nearest_peak(&start_peaks, m.1, tol)).collect(),
-            members.iter().map(|m| nearest_peak(&end_peaks, m.2, tol)).collect(),
-        )
-    } else {
-        (
-            members.iter().map(|m| Some(m.1.div_euclid(tol))).collect(),
-            members.iter().map(|m| Some(m.2.div_euclid(tol))).collect(),
-        )
-    };
+    let width = cfg.peak_width.max(1) as i32;
+    let start_peaks = find_peaks(members.iter().map(|m| m.1), width, cfg.min_iso);
+    let end_peaks = find_peaks(members.iter().map(|m| m.2), width, cfg.min_iso);
+    let mut start_key: Vec<Option<i32>> =
+        members.iter().map(|m| nearest_peak(&start_peaks, m.1, tol)).collect();
+    let end_key: Vec<Option<i32>> =
+        members.iter().map(|m| nearest_peak(&end_peaks, m.2, tol)).collect();
     match cfg.start_split {
         StartSplit::On => {}
         StartSplit::Off => start_key.fill(Some(NO_START)),

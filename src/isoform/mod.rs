@@ -2,28 +2,24 @@
 //! sequence. Used by `predict` after clustering, and by `find-isoforms` on an existing
 //! cluster assignment.
 //!
-//! [`resolve_cluster`] runs five steps on a cluster:
+//! [`resolve_cluster`] runs four steps on a cluster:
 //!
 //!   1. Group by structure ([`fit`]). Reads are taken longest first: each round the longest
 //!      unassigned read is the backbone, every other unassigned read that fits it joins its
 //!      group, and the rest wait for a later round.
-//!   2. Split a group where many reads share one indel at the same position ([`variant`];
-//!      off by default). This runs before step 3, which would otherwise mix two structures
-//!      that share their ends.
-//!   3. Split each group by where its reads start and end ([`ends`]).
-//!   4. Keep groups of at least `min_iso` reads and build each one's consensus ([`consensus`]).
-//!   5. Merge isoforms whose consensuses show they are the same transcript ([`collapse`]).
+//!   2. Split each group by where its reads start and end ([`ends`]).
+//!   3. Keep groups of at least `min_iso` reads and build each one's consensus ([`consensus`]).
+//!   4. Merge isoforms whose consensuses show they are the same transcript ([`collapse`]).
 //!
 //! Which test tells two isoforms apart:
 //!
 //!   extra sequence in one piece (exon, retained intron)   interior-gap indel run   step 1
 //!   same-length but different sequence (MXE)              interior-gap identity    step 1
 //!   different sequence at one end                         unmatched flank          step 1
-//!   a splice site shifted by a few bases                  recurrent indel          step 2
-//!   different transcription start or end                  end peaks                step 3
+//!   different transcription start or end                  end peaks                step 2
 //!     (with `--start-split off|auto` 3' ends only, plus validated starts for auto: 5'
 //!     starts in cDNA mostly mark truncation)
-//!   the same transcript found by two groups               consensus identity       step 5
+//!   the same transcript found by two groups               consensus identity       step 4
 //!
 //! Differences confined to a flank shorter than `max_flank` are not detected. The defaults
 //! were tuned on PacBio HiFi SIRV reads; ONT data has not been measured.
@@ -34,14 +30,13 @@ use std::time::Instant;
 mod anchors; // minimizer anchors and their collinear chain
 mod ba; // block-aligner calls: flank extension, gap alignment, indel events
 mod cli; // the `find-isoforms` subcommand
-mod collapse; // step 5
-mod consensus; // step 4
-mod ends; // step 3
+mod collapse; // step 4
+mod consensus; // step 3
+mod ends; // step 2
 mod fit; // step 1
 mod options; // Cfg, its defaults, flags and help text
 mod output; // output files
 pub(crate) mod stats; // diagnostic counters
-mod variant; // step 2
 
 use anchors::MinimizerMap;
 pub use cli::{parse_args, run, usage, Config};
@@ -58,7 +53,7 @@ pub struct Read {
 pub(crate) struct Isoform {
     /// Member reads, as indices into the cluster's reads.
     pub members: Vec<usize>,
-    /// Consensus sequence, or the longest member read when consensus is off.
+    /// Consensus sequence.
     pub consensus: Vec<u8>,
     /// Starts at a downstream transcription start that `--start-split auto` validated, so
     /// collapse must not fold it into a longer isoform that differs only at the 5' end.
@@ -85,27 +80,19 @@ pub(crate) fn resolve_cluster(reads: &[Read], cfg: &Cfg) -> Vec<Isoform> {
     let isoforms: Vec<Isoform> = groups
         .into_iter()
         .map(|(members, alt_start, part)| {
-            let consensus = if cfg.consensus {
-                consensus::refine_consensus_with_maps(reads, &members, &parts[part], &maps)
-            } else {
-                let longest = *members.iter().max_by_key(|&&i| reads[i].seq.len()).unwrap();
-                reads[longest].seq.clone()
-            };
+            let consensus =
+                consensus::refine_consensus_with_maps(reads, &members, &parts[part], &maps);
             Isoform { members, consensus, alt_start }
         })
         .collect();
     stats::add_elapsed(&stats::T_CONS, t);
 
-    if cfg.collapse {
-        collapse::collapse(isoforms, reads, &maps, cfg)
-    } else {
-        isoforms
-    }
+    collapse::collapse(isoforms, reads, &maps, cfg)
 }
 
-/// Steps 1–3 and the `min_iso` filter. Each isoform, largest first, as its member read
+/// Steps 1–2 and the `min_iso` filter. Each isoform, largest first, as its member read
 /// indices, whether it starts at a validated downstream start, and the index of its
-/// structure group (after any variant split) in the second list, which holds each group's
+/// structure group in the second list, which holds each group's
 /// reads: they share the isoform's structure, so they may vote in its consensus.
 fn partition(
     reads: &[Read],
@@ -116,13 +103,11 @@ fn partition(
     let mut parts: Vec<Vec<usize>> = Vec::new();
     for group in &group_by_structure(reads, maps, cfg) {
         let backbone = group[0].0;
-        for part in variant::split_on_recurrent_indels(group, backbone, reads, cfg, 0) {
-            let pi = parts.len();
-            parts.push(part.iter().map(|m| m.0).collect());
-            for (iso, alt_start) in ends::split_by_ends(&part, reads, backbone, cfg) {
-                if iso.len() >= cfg.min_iso {
-                    isoforms.push((iso, alt_start, pi));
-                }
+        let pi = parts.len();
+        parts.push(group.iter().map(|m| m.0).collect());
+        for (iso, alt_start) in ends::split_by_ends(group, reads, backbone, cfg) {
+            if iso.len() >= cfg.min_iso {
+                isoforms.push((iso, alt_start, pi));
             }
         }
     }
