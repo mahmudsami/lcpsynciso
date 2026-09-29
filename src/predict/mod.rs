@@ -7,6 +7,9 @@
 //!   B. Cluster the stored reads greedily, longest first ([`GreedyClusterer`]).
 //!   C. Detect the isoforms of each cluster ([`isoform::detect_isoforms`]), in parallel across
 //!      clusters, largest first, and write the output files.
+//!
+//! Phases A and B are shared with the `cluster` subcommand and live in the `cluster` module
+//! (`load_reads`, `cluster_reads`).
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -14,20 +17,15 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::cluster::{
-    count_seeds, informative_seeds, merge_seed_counts, weighted_seeds, GreedyClusterer, SeedCounts,
-    SeedParams,
-};
+use crate::cluster::{cluster_reads, informative_seeds, load_reads, GreedyClusterer, SeedParams};
 use crate::isoform::{
     self, apply_isoform_flag, ClusterRecords, OutputFiles, Read, IsoformOptions, ISOFORM_HELP,
 };
 use crate::read_store::ReadStore;
-use crate::seedmap::{new_seed_map, SeedMap};
-use crate::seqio::SeqReader;
 
 pub struct Config {
     pub reads_path: String,
@@ -195,7 +193,8 @@ pub fn run(config: Config) {
         "[predict] phase A: reading {} once (pack + seed frequencies) ...",
         config.reads_path
     );
-    let (store, counts, [d_read, d_seed, d_pack]) = load_reads(&config, seed_params);
+    let (store, counts, [d_read, d_seed, d_pack]) =
+        load_reads(&config.reads_path, config.batch_size, config.max_reads, seed_params, "predict");
     let n_reads = store.len();
     let n_distinct_seeds = counts.len();
     let informative = informative_seeds(&counts, config.min_occ, config.max_occ);
@@ -221,7 +220,16 @@ pub fn run(config: Config) {
         "[predict] phase B: greedy clustering (min-shared={}, min-shared-frac={}) ...",
         config.min_shared, config.min_shared_frac
     );
-    let cluster_members = cluster_reads(&config, seed_params, &store, informative);
+    let clusterer = GreedyClusterer::new(config.min_shared, config.min_shared_frac);
+    let cluster_members = cluster_reads(
+        &store,
+        seed_params,
+        informative,
+        &config.level_weights,
+        clusterer,
+        config.batch_size,
+        "predict",
+    );
     let n_clusters = cluster_members.len();
     let phase_b_time = phase_b_start.elapsed();
     eprintln!("[predict] === phase B (clustering) took {:.1}s ===", phase_b_time.as_secs_f64());
@@ -231,16 +239,16 @@ pub fn run(config: Config) {
 
     // ── Phase C: detect isoforms ──
     let phase_c_start = Instant::now();
-    let mut targets: Vec<u32> = (0..n_clusters as u32)
+    let mut eligible_clusters: Vec<u32> = (0..n_clusters as u32)
         .filter(|&c| {
             let size = cluster_members[c as usize].len();
             size >= config.min_cluster_size && size <= config.max_cluster_size
         })
         .collect();
-    targets.sort_unstable_by_key(|&c| Reverse(cluster_members[c as usize].len()));
+    eligible_clusters.sort_unstable_by_key(|&c| Reverse(cluster_members[c as usize].len()));
     eprintln!(
         "[predict] phase C: detecting isoforms for {} clusters (parallel) ...",
-        targets.len()
+        eligible_clusters.len()
     );
 
     let writer = Mutex::new(OrderedWriter::new(OutputFiles::create(&config.out_dir)));
@@ -251,7 +259,7 @@ pub fn run(config: Config) {
     // cluster at a time, so the largest clusters spread over all threads. (An indexed
     // `par_iter` splits the list into contiguous ranges, and one thread would get the first
     // range: every one of the largest clusters.)
-    targets.iter().enumerate().par_bridge().for_each(|(position, &cid)| {
+    eligible_clusters.iter().enumerate().par_bridge().for_each(|(position, &cid)| {
         let (records, n_isoforms) = detect_and_format_isoforms(
             cid,
             &cluster_members[cid as usize],
@@ -263,7 +271,7 @@ pub fn run(config: Config) {
         writer.lock().unwrap().push(position, records, n_isoforms);
         let done = finished.fetch_add(1, Relaxed) + 1;
         if done % 10_000 == 0 {
-            eprintln!("[predict]   phase C {} of {} clusters ...", done, targets.len());
+            eprintln!("[predict]   phase C {} of {} clusters ...", done, eligible_clusters.len());
         }
     });
     let (total_isoforms, n_processed_clusters) = writer.into_inner().unwrap().finish();
@@ -310,141 +318,12 @@ fn write_clusters(dir: &str, cluster_members: &[Vec<u32>], store: &ReadStore) {
     w.flush().unwrap();
 }
 
-/// Phase A: pack every read into a [`ReadStore`] while counting seeds, a batch at a time.
-/// Also returns the time spent reading, counting, and packing.
-fn load_reads(config: &Config, seed_params: SeedParams) -> (ReadStore, SeedCounts, [Duration; 3]) {
-    let mut store = ReadStore::default();
-    let mut counts: SeedCounts = new_seed_map();
-    let (mut d_read, mut d_seed, mut d_pack) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-    let mut reader = SeqReader::open(&config.reads_path);
-    let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(config.batch_size);
-    loop {
-        batch.clear();
-        let remaining = config.max_reads.saturating_sub(store.len());
-        if remaining == 0 {
-            break;
-        }
-        let want = config.batch_size.min(remaining);
-        let lap_start = Instant::now();
-        while batch.len() < want {
-            match reader.next() {
-                Some(record) => batch.push(record),
-                None => break,
-            }
-        }
-        d_read += lap_start.elapsed();
-        if batch.is_empty() {
-            break;
-        }
-
-        let lap_start = Instant::now();
-        let part = count_seeds(batch.par_iter().map(|(_, seq)| seq.as_slice()), seed_params);
-        merge_seed_counts(&mut counts, part);
-        d_seed += lap_start.elapsed();
-
-        let lap_start = Instant::now();
-        for (name, seq) in batch.drain(..) {
-            store.push(name, &seq);
-        }
-        d_pack += lap_start.elapsed();
-        eprintln!("[predict]   phase A {} reads ...", store.len());
-    }
-    (store, counts, [d_read, d_seed, d_pack])
-}
-
-/// The clustering order: longest read first, ties in file order. A counting sort over read
-/// lengths, so visiting the reads in file order yields each one's rank without storing a
-/// read -> rank table.
-struct LengthRanks {
-    /// Read length -> rank of the next read of that length.
-    next: BTreeMap<usize, u32>,
-}
-
-impl LengthRanks {
-    fn new(store: &ReadStore) -> Self {
-        let mut next: BTreeMap<usize, u32> = BTreeMap::new();
-        for read_idx in 0..store.len() {
-            *next.entry(store.read_len(read_idx)).or_insert(0) += 1;
-        }
-        // Counts -> first rank of each length, longest first.
-        let mut rank = 0u32;
-        for c in next.values_mut().rev() {
-            let count = *c;
-            *c = rank;
-            rank += count;
-        }
-        LengthRanks { next }
-    }
-
-    /// Rank of the next read of length `len`, visiting reads in file order.
-    fn rank(&mut self, len: usize) -> usize {
-        let r = self.next.get_mut(&len).expect("length counted in LengthRanks::new");
-        *r += 1;
-        (*r - 1) as usize
-    }
-}
-
-/// Phase B: cluster the stored reads, longest first, and return each cluster's member read
-/// indices in file order. Seeds are computed in parallel per batch; assignment is sequential.
-///
-/// The reads stay where they are in the store. One `u32` per read, `slot`, first holds the
-/// read at each rank, then, once that read is assigned, its cluster id. So sorting costs
-/// no memory beyond the per-read cluster id that clustering needs anyway.
-fn cluster_reads(
-    config: &Config,
-    seed_params: SeedParams,
-    store: &ReadStore,
-    informative: SeedMap<u8>,
-) -> Vec<Vec<u32>> {
-    let n_reads = store.len();
-    let mut slot: Vec<u32> = vec![0; n_reads];
-    let mut ranks = LengthRanks::new(store);
-    for read_idx in 0..n_reads {
-        slot[ranks.rank(store.read_len(read_idx))] = read_idx as u32;
-    }
-
-    let mut clusterer = GreedyClusterer::new(config.min_shared, config.min_shared_frac);
-    let mut start = 0;
-    while start < n_reads {
-        let end = (start + config.batch_size).min(n_reads);
-        let seeds: Vec<Vec<(u64, u32)>> = slot[start..end]
-            .par_iter()
-            .map(|&read_idx| {
-                weighted_seeds(
-                    &store.read_seq(read_idx as usize),
-                    seed_params,
-                    &informative,
-                    &config.level_weights,
-                )
-            })
-            .collect();
-        for (offset, read_seeds) in seeds.iter().enumerate() {
-            slot[start + offset] = clusterer.assign(read_seeds);
-        }
-        eprintln!("[predict]   phase B {} reads, {} clusters ...", end, clusterer.n_clusters());
-        start = end;
-    }
-    let n_clusters = clusterer.n_clusters();
-    // Free the seed tables before building the member lists.
-    drop(clusterer);
-    drop(informative);
-
-    // Replay the ranks in file order to map each read to its cluster id.
-    let mut ranks = LengthRanks::new(store);
-    let mut cluster_members: Vec<Vec<u32>> = vec![Vec::new(); n_clusters];
-    for read_idx in 0..n_reads {
-        let c = slot[ranks.rank(store.read_len(read_idx))];
-        cluster_members[c as usize].push(read_idx as u32);
-    }
-    cluster_members
-}
-
-/// Phase C output. Clusters finish in any order but are written in `targets` order, so the
-/// output files do not depend on thread timing: a finished cluster waits here until every
-/// cluster before it has been written.
+/// Phase C output. Clusters finish in any order but are written in `eligible_clusters` order,
+/// so the output files do not depend on thread timing: a finished cluster waits here until
+/// every cluster before it has been written.
 struct OrderedWriter {
     out: OutputFiles,
-    /// Finished clusters by position in `targets`, with their isoform counts.
+    /// Finished clusters by position in `eligible_clusters`, with their isoform counts.
     waiting: BTreeMap<usize, (ClusterRecords, usize)>,
     /// Position of the next cluster to write.
     next: usize,

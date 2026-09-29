@@ -7,7 +7,7 @@ binary, pure Rust, no external tools.
 | Command | What it does |
 |---|---|
 | `predict` | Clusters the reads and detects isoforms in a single run. The input file is read once and held in memory, 2-bit packed. |
-| `cluster` | Clustering only. |
+| `cluster` | Clustering only, with the same clustering settings as `predict`. Also reads the input once and holds it in memory, 2-bit packed. |
 | `find-isoforms` | Isoforms for an existing cluster assignment. The reads file does not need to be sorted by cluster. Single-threaded. |
 
 ## Build
@@ -39,9 +39,8 @@ Input is FASTA or FASTQ, plain or gzip/bgzf; compression is recognised by a `.gz
 already be oriented (for example PacBio FLNC reads).
 
 `--threads` (default 0, meaning all cores) applies to `predict` and `cluster`. Run
-`lcpsynciso <command> --help` for every option and its default. Note that the clustering
-thresholds differ: `--min-shared` is 3 for `predict` and 8 for `cluster`, and
-`--min-shared-frac` is 0.1 for `predict` and off for `cluster`.
+`lcpsynciso <command> --help` for every option and its default. `predict` and `cluster`
+cluster identically by default (`--min-shared` 3, `--min-shared-frac` 0.1).
 
 ### Outputs
 
@@ -68,15 +67,14 @@ left out of `isoform_assignments.tsv`.
 ## How it works
 
 **Clustering.** Seeds are LCP-syncmer block hashes from several levels. Only seeds found
-in between `--min-occ` and `--max-occ` reads are used. Reads are clustered greedily: in
-`predict`, longest read first (ties in file order), so each cluster is seeded by its most
-complete read; in `cluster`, which does not hold the reads, in file order. Each seed
-already claimed by a cluster votes for it, weighted by the seed's level. A read joins the
-winning cluster if its votes reach `--min-shared` and also `--min-shared-frac` of the
-read's own total seed weight, and otherwise starts a new cluster. The fraction stops a read
-from joining an unrelated gene's cluster through a few seeds shared by chance, such as a
-repeat in a UTR; longest-first order needs it, because the longest reads start clusters
-first.
+in between `--min-occ` and `--max-occ` reads are used. Reads are clustered greedily,
+longest read first (ties in file order), so each cluster is seeded by its most complete
+read; `predict` and `cluster` share this step. Each seed already claimed by a cluster
+votes for it, weighted by the seed's level. A read joins the winning cluster if its votes
+reach `--min-shared` and also `--min-shared-frac` of the read's own total seed weight, and
+otherwise starts a new cluster. The fraction stops a read from joining an unrelated gene's
+cluster through a few seeds shared by chance, such as a repeat in a UTR; longest-first
+order needs it, because the longest reads start clusters first.
 
 **Isoforms**, per cluster:
 
@@ -122,7 +120,7 @@ src/
   main.rs         subcommand dispatch
   lib.rs          library root
   predict/        predict
-  cluster/        cluster, plus the seed counting and greedy clustering predict uses
+  cluster/        cluster, plus the reading, seed counting and greedy clustering predict shares
   isoform/        isoform detection and find-isoforms
     mod.rs          overview of the four steps
     fit.rs          step 1: does a read match the backbone
