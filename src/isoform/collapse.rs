@@ -1,6 +1,6 @@
 //! Step 4: merge isoforms that turn out to be the same transcript.
 //!
-//! Resolution can split one transcript into several isoforms: reads whose errors break
+//! Detection can split one transcript into several isoforms: reads whose errors break
 //! their anchors fail step 1 and gather in small satellite groups, and a read rejected by
 //! one backbone can found a duplicate group. Consensuses are error-corrected, so they can be
 //! compared more strictly than reads were.
@@ -23,143 +23,160 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::anchors::{minimizer_map, MinimizerMap};
-use super::fit::{fits_interval, strip_homopolymer_ends};
-use super::{ba, consensus, Cfg, Isoform, Read};
+use super::fit::{place_on_backbone, strip_homopolymer_ends};
+use super::{align, consensus, Isoform, Read, IsoformOptions};
 
-/// Resolve duplicates among `isos`, whose members index `reads` (with minimizer maps
+/// Merge duplicate isoforms among `isoforms`, whose members index `reads` (with minimizer maps
 /// `read_maps`, used to rebuild a consensus).
-pub(super) fn collapse(
-    mut isos: Vec<Isoform>,
+pub(super) fn merge_duplicates(
+    mut isoforms: Vec<Isoform>,
     reads: &[Read],
     read_maps: &[MinimizerMap],
-    cfg: &Cfg,
+    options: &IsoformOptions,
 ) -> Vec<Isoform> {
-    if isos.len() < 2 {
-        return isos;
+    if isoforms.len() < 2 {
+        return isoforms;
     }
-    isos.sort_by_key(|iso| Reverse(iso.members.len()));
-    let maps: Vec<MinimizerMap> =
-        isos.iter().map(|iso| minimizer_map(&iso.consensus, cfg.k, cfg.w)).collect();
-    let strict = Cfg {
-        min_cov: cfg.min_cov.max(0.95),
-        max_gap: cfg.collapse_gap,
-        max_indel_run: cfg.collapse_gap + 1,
-        ..cfg.clone()
+    isoforms.sort_by_key(|isoform| Reverse(isoform.members.len()));
+    let consensus_maps: Vec<MinimizerMap> = isoforms
+        .iter()
+        .map(|isoform| minimizer_map(&isoform.consensus, options.minimizer_k, options.minimizer_w))
+        .collect();
+    let strict = IsoformOptions {
+        min_cov: options.min_cov.max(0.95),
+        max_gap: options.collapse_gap,
+        max_indel_run: options.collapse_gap + 1,
+        ..options.clone()
     };
 
-    let n = isos.len();
-    let mut target: Vec<Option<usize>> = vec![None; n]; // merged isoform -> kept isoform
+    let n = isoforms.len();
+    let mut merged_into: Vec<Option<usize>> = vec![None; n]; // merged isoform -> kept isoform
     let mut rebuild = vec![false; n]; // kept isoform absorbed a more complete copy of itself
     let mut kept: Vec<usize> = Vec::new();
     for i in 0..n {
         let mut into = None;
         for &j in &kept {
-            match should_merge(&isos[i], &isos[j], &maps[i], &maps[j], cfg, &strict) {
-                Merge::No => continue,
-                Merge::Yes => {}
-                Merge::Extends => rebuild[j] = true,
+            match decide_merge(
+                &isoforms[i],
+                &isoforms[j],
+                &consensus_maps[i],
+                &consensus_maps[j],
+                options,
+                &strict,
+            ) {
+                MergeDecision::KeepSeparate => continue,
+                MergeDecision::Merge => {}
+                MergeDecision::MergeAndRebuild => rebuild[j] = true,
             }
             into = Some(j);
             break;
         }
         match into {
-            Some(j) => target[i] = Some(j),
+            Some(j) => merged_into[i] = Some(j),
             None => kept.push(i),
         }
     }
 
     // Kept isoforms in visiting order, each absorbing the reads merged into it.
     let mut pos: HashMap<usize, usize> = HashMap::new();
-    let mut out: Vec<Isoform> = Vec::with_capacity(kept.len());
-    for (p, &k) in kept.iter().enumerate() {
-        pos.insert(k, p);
-        out.push(Isoform {
-            members: std::mem::take(&mut isos[k].members),
-            consensus: std::mem::take(&mut isos[k].consensus),
-            alt_start: isos[k].alt_start,
+    let mut kept_isoforms: Vec<Isoform> = Vec::with_capacity(kept.len());
+    for (p, &kept_idx) in kept.iter().enumerate() {
+        pos.insert(kept_idx, p);
+        kept_isoforms.push(Isoform {
+            members: std::mem::take(&mut isoforms[kept_idx].members),
+            consensus: std::mem::take(&mut isoforms[kept_idx].consensus),
+            alt_start: isoforms[kept_idx].alt_start,
         });
     }
     for i in 0..n {
-        if let Some(j) = target[i] {
-            let extra = std::mem::take(&mut isos[i].members);
-            out[pos[&j]].members.extend(extra);
+        if let Some(j) = merged_into[i] {
+            let extra = std::mem::take(&mut isoforms[i].members);
+            kept_isoforms[pos[&j]].members.extend(extra);
         }
     }
-    for (p, &k) in kept.iter().enumerate() {
-        if rebuild[k] {
-            let iso = &mut out[p];
-            iso.consensus =
-                consensus::refine_consensus_with_maps(reads, &iso.members, &iso.members, read_maps);
+    for (p, &kept_idx) in kept.iter().enumerate() {
+        if rebuild[kept_idx] {
+            let isoform = &mut kept_isoforms[p];
+            isoform.consensus =
+                consensus::build_consensus(reads, &isoform.members, &isoform.members, read_maps);
         }
     }
-    out
+    kept_isoforms
 }
 
 /// How `small` relates to a larger isoform it may merge into.
-enum Merge {
-    No,
-    Yes,
+enum MergeDecision {
+    KeepSeparate,
+    Merge,
     /// Merge, and `small` is a more complete copy of `big`: rebuild the consensus.
-    Extends,
+    MergeAndRebuild,
 }
 
 /// Whether `small` (with no more reads than `big`) should merge into `big`. `strict` is
-/// `cfg` tightened for comparing consensuses.
-fn should_merge(
+/// `options` tightened for comparing consensuses.
+fn decide_merge(
     small: &Isoform,
     big: &Isoform,
     small_map: &MinimizerMap,
     big_map: &MinimizerMap,
-    cfg: &Cfg,
-    strict: &Cfg,
-) -> Merge {
-    if same_sequence(small, big, cfg) {
-        return Merge::Yes;
+    options: &IsoformOptions,
+    strict: &IsoformOptions,
+) -> MergeDecision {
+    if consensuses_near_identical(small, big, options) {
+        return MergeDecision::Merge;
     }
-    if small.members.len() as f64 > cfg.collapse_ratio * big.members.len() as f64 {
-        return Merge::No;
+    if small.members.len() as f64 > options.collapse_ratio * big.members.len() as f64 {
+        return MergeDecision::KeepSeparate;
     }
     // Containment, testing the shorter consensus against the longer. An end reaching more
     // than `collapse_gap` bp past the other's is a real extension, not a consensus wobble.
     // An isoform at a validated downstream start is a transcript of its own, so a pair that
     // differs at the 5' end stays apart when either is one.
-    let gap = cfg.collapse_gap as i32;
-    let alt = small.alt_start || big.alt_start;
+    let end_slack = options.collapse_gap as i32;
+    let either_alt_start = small.alt_start || big.alt_start;
     if small.consensus.len() <= big.consensus.len() {
         // `small` placed on `big`; it may overhang `big`'s 5' end (a negative start).
-        match fits_interval(small_map, big_map, &small.consensus, &big.consensus, strict) {
-            None => Merge::No,
-            Some((s, e)) if s < -gap => {
+        match place_on_backbone(small_map, big_map, &small.consensus, &big.consensus, strict) {
+            None => MergeDecision::KeepSeparate,
+            Some((start, end)) if start < -end_slack => {
                 // Same 3' end: `small` is `big` with its 5' end intact. Otherwise the two
                 // differ at both ends and stay apart.
-                if !alt && e >= big.consensus.len() as i32 - cfg.boundary_tol as i32 {
-                    Merge::Extends
+                if !either_alt_start
+                    && end >= big.consensus.len() as i32 - options.boundary_tol as i32
+                {
+                    MergeDecision::MergeAndRebuild
                 } else {
-                    Merge::No
+                    MergeDecision::KeepSeparate
                 }
             }
-            Some(_) => Merge::Yes,
+            Some(_) => MergeDecision::Merge,
         }
     } else {
         // `big` placed on `small`: `small` extends it at the 5' end, the 3' end, or both.
-        match fits_interval(big_map, small_map, &big.consensus, &small.consensus, strict) {
-            None => Merge::No,
-            Some((s, _)) if s > gap && alt => Merge::No,
-            Some((s, e)) if s > gap || e < small.consensus.len() as i32 - gap => Merge::Extends,
-            Some(_) => Merge::Yes,
+        match place_on_backbone(big_map, small_map, &big.consensus, &small.consensus, strict) {
+            None => MergeDecision::KeepSeparate,
+            Some((start, _)) if start > end_slack && either_alt_start => {
+                MergeDecision::KeepSeparate
+            }
+            Some((start, end))
+                if start > end_slack || end < small.consensus.len() as i32 - end_slack =>
+            {
+                MergeDecision::MergeAndRebuild
+            }
+            Some(_) => MergeDecision::Merge,
         }
     }
 }
 
 /// Near-identical consensuses, ignoring homopolymer ends: identity at least `collapse_ident`,
 /// with the longest indel and the length difference both within `collapse_gap`.
-fn same_sequence(a: &Isoform, b: &Isoform, cfg: &Cfg) -> bool {
-    let a = strip_homopolymer_ends(&a.consensus);
-    let b = strip_homopolymer_ends(&b.consensus);
-    let st = ba::gap_runs(a, b);
-    st.ident() >= cfg.collapse_ident
-        && st.max_indel <= cfg.collapse_gap as usize
-        && (a.len() as i64 - b.len() as i64).unsigned_abs() as u32 <= cfg.collapse_gap
+fn consensuses_near_identical(a: &Isoform, b: &Isoform, options: &IsoformOptions) -> bool {
+    let a_seq = strip_homopolymer_ends(&a.consensus);
+    let b_seq = strip_homopolymer_ends(&b.consensus);
+    let alignment = align::align_global(a_seq, b_seq);
+    alignment.ident() >= options.collapse_ident
+        && alignment.longest_indel <= options.collapse_gap as usize
+        && (a_seq.len() as i64 - b_seq.len() as i64).unsigned_abs() as u32 <= options.collapse_gap
 }
 
 #[cfg(test)]
@@ -186,12 +203,14 @@ mod tests {
         let reads: Vec<Read> = seqs
             .iter()
             .enumerate()
-            .map(|(i, s)| Read { name: i.to_string(), seq: s.clone() })
+            .map(|(read_idx, seq)| Read { name: read_idx.to_string(), seq: seq.clone() })
             .collect();
-        let cfg = Cfg::default();
-        let maps: Vec<MinimizerMap> =
-            reads.iter().map(|r| minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
-        let isos = vec![
+        let options = IsoformOptions::default();
+        let read_maps: Vec<MinimizerMap> = reads
+            .iter()
+            .map(|r| minimizer_map(&r.seq, options.minimizer_k, options.minimizer_w))
+            .collect();
+        let isoforms = vec![
             Isoform {
                 members: (0..10).collect(),
                 consensus: truth[500..].to_vec(),
@@ -203,7 +222,7 @@ mod tests {
                 alt_start: false,
             },
         ];
-        let out = collapse(isos, &reads, &maps, &cfg);
+        let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].members.len(), 13);
         assert_eq!(out[0].consensus, truth);
@@ -217,12 +236,14 @@ mod tests {
         let reads: Vec<Read> = seqs
             .iter()
             .enumerate()
-            .map(|(i, s)| Read { name: i.to_string(), seq: s.clone() })
+            .map(|(read_idx, seq)| Read { name: read_idx.to_string(), seq: seq.clone() })
             .collect();
-        let cfg = Cfg::default();
-        let maps: Vec<MinimizerMap> =
-            reads.iter().map(|r| minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
-        let isos = vec![
+        let options = IsoformOptions::default();
+        let read_maps: Vec<MinimizerMap> = reads
+            .iter()
+            .map(|r| minimizer_map(&r.seq, options.minimizer_k, options.minimizer_w))
+            .collect();
+        let isoforms = vec![
             Isoform {
                 members: (0..10).collect(),
                 consensus: truth[500..].to_vec(),
@@ -234,7 +255,7 @@ mod tests {
                 alt_start: false,
             },
         ];
-        assert_eq!(collapse(isos, &reads, &maps, &cfg).len(), 2);
+        assert_eq!(merge_duplicates(isoforms, &reads, &read_maps, &options).len(), 2);
     }
 
     #[test]
@@ -247,12 +268,14 @@ mod tests {
         let reads: Vec<Read> = seqs
             .iter()
             .enumerate()
-            .map(|(i, s)| Read { name: i.to_string(), seq: s.clone() })
+            .map(|(read_idx, seq)| Read { name: read_idx.to_string(), seq: seq.clone() })
             .collect();
-        let cfg = Cfg::default();
-        let maps: Vec<MinimizerMap> =
-            reads.iter().map(|r| minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
-        let isos = vec![
+        let options = IsoformOptions::default();
+        let read_maps: Vec<MinimizerMap> = reads
+            .iter()
+            .map(|r| minimizer_map(&r.seq, options.minimizer_k, options.minimizer_w))
+            .collect();
+        let isoforms = vec![
             Isoform {
                 members: (0..10).collect(),
                 consensus: truth[..900].to_vec(),
@@ -264,7 +287,7 @@ mod tests {
                 alt_start: false,
             },
         ];
-        let out = collapse(isos, &reads, &maps, &cfg);
+        let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].consensus, truth);
     }

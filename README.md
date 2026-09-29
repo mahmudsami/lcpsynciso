@@ -1,12 +1,12 @@
 # lcpsynciso
 
 Cluster long transcript reads (PacBio HiFi or ONT) by shared LCP-syncmer seeds, then
-resolve the isoforms within each cluster and build a consensus sequence for each. One
+detect the isoforms within each cluster and build a consensus sequence for each. One
 binary, pure Rust, no external tools.
 
 | Command | What it does |
 |---|---|
-| `predict` | Clusters the reads and resolves isoforms in a single run. The input file is read once and held in memory, 2-bit packed. |
+| `predict` | Clusters the reads and detects isoforms in a single run. The input file is read once and held in memory, 2-bit packed. |
 | `cluster` | Clustering only. |
 | `find-isoforms` | Isoforms for an existing cluster assignment. The reads file does not need to be sorted by cluster. Single-threaded. |
 
@@ -121,22 +121,22 @@ first.
 src/
   main.rs         subcommand dispatch
   lib.rs          library root
-  pipeline/       predict
+  predict/        predict
   cluster/        cluster, plus the seed counting and greedy clustering predict uses
-  isoform/        isoform resolution and find-isoforms
+  isoform/        isoform detection and find-isoforms
     mod.rs          overview of the four steps
     fit.rs          step 1: does a read match the backbone
     ends.rs         step 2: split by read ends
     consensus.rs    step 3: consensus
     collapse.rs     step 4: merge duplicates
     anchors.rs      minimizers and anchor chaining
-    ba.rs           block-aligner calls
+    align.rs        block-aligner calls
     options.rs      settings, defaults, shared flags and help
     output.rs       output files
     stats.rs        diagnostic counters
-    cli.rs          find-isoforms
+    find_isoforms.rs find-isoforms
   seeds/          LCP-syncmer seeds (from synpact)
-  io/             FASTA/FASTQ reader
-  seqstore.rs     2-bit packed read store
-  hashmap.rs      map keyed by seed hashes
+  seqio/          FASTA/FASTQ reader
+  read_store.rs   2-bit packed read store
+  seedmap.rs      map keyed by seed hashes
 ```

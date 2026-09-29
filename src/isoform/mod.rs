@@ -1,8 +1,8 @@
-//! Isoform resolution: split the reads of one cluster into isoforms, each with a consensus
+//! Isoform detection: split the reads of one cluster into isoforms, each with a consensus
 //! sequence. Used by `predict` after clustering, and by `find-isoforms` on an existing
 //! cluster assignment.
 //!
-//! [`resolve_cluster`] runs four steps on a cluster:
+//! [`detect_isoforms`] runs four steps on a cluster:
 //!
 //!   1. Group by structure ([`fit`]). Reads are taken longest first: each round the longest
 //!      unassigned read is the backbone, every other unassigned read that fits it joins its
@@ -27,31 +27,31 @@
 use std::cmp::Reverse;
 use std::time::Instant;
 
+mod align; // block-aligner calls: flank extension, global alignment, longest indel
 mod anchors; // minimizer anchors and their collinear chain
-mod ba; // block-aligner calls: flank extension, gap alignment, indel events
-mod cli; // the `find-isoforms` subcommand
 mod collapse; // step 4
 mod consensus; // step 3
 mod ends; // step 2
+mod find_isoforms; // the `find-isoforms` subcommand
 mod fit; // step 1
-mod options; // Cfg, its defaults, flags and help text
+mod options; // IsoformOptions, its defaults, flags and help text
 mod output; // output files
 pub(crate) mod stats; // diagnostic counters
 
 use anchors::MinimizerMap;
-pub use cli::{parse_args, run, usage, Config};
-pub use options::{Cfg, StartSplit};
-pub(crate) use options::{parse_flag, RESOLVE_HELP};
-pub(crate) use output::{render, OutputFiles, Rendered};
+pub use find_isoforms::{parse_args, run, print_usage, Config};
+pub use options::{IsoformOptions, StartSplit};
+pub(crate) use options::{apply_isoform_flag, ISOFORM_HELP};
+pub(crate) use output::{format_cluster_records, OutputFiles, ClusterRecords};
 
 pub struct Read {
     pub name: String,
     pub seq: Vec<u8>,
 }
 
-/// One resolved isoform.
+/// One detected isoform.
 pub(crate) struct Isoform {
-    /// Member reads, as indices into the cluster's reads.
+    /// The isoform's reads, as indices into the cluster's reads.
     pub members: Vec<usize>,
     /// Consensus sequence.
     pub consensus: Vec<u8>,
@@ -60,80 +60,98 @@ pub(crate) struct Isoform {
     pub alt_start: bool,
 }
 
-/// A read placed on its group's backbone: (read index, start, end), with start and end in
+/// A read placed on its group's backbone: (read_idx, start, end), with start and end in
 /// backbone coordinates.
-type Member = (usize, i32, i32);
+type PlacedRead = (usize, i32, i32);
 
-/// Resolve one cluster's reads into isoforms. Clusters are independent, so callers can
-/// resolve many in parallel.
-pub(crate) fn resolve_cluster(reads: &[Read], cfg: &Cfg) -> Vec<Isoform> {
-    let t = Instant::now();
-    let maps: Vec<MinimizerMap> =
-        reads.iter().map(|r| anchors::minimizer_map(&r.seq, cfg.k, cfg.w)).collect();
-    stats::add_elapsed(&stats::T_MAPS, t);
+/// Detect the isoforms in one cluster's reads. Clusters are independent, so callers can
+/// detect many at once.
+pub(crate) fn detect_isoforms(reads: &[Read], options: &IsoformOptions) -> Vec<Isoform> {
+    let lap_start = Instant::now();
+    let read_maps: Vec<MinimizerMap> = reads
+        .iter()
+        .map(|read| anchors::minimizer_map(&read.seq, options.minimizer_k, options.minimizer_w))
+        .collect();
+    stats::add_elapsed(&stats::T_MAPS, lap_start);
 
-    let t = Instant::now();
-    let (groups, parts) = partition(reads, &maps, cfg);
-    stats::add_elapsed(&stats::T_SPLIT, t);
+    let lap_start = Instant::now();
+    let (drafts, reads_by_group) = partition(reads, &read_maps, options);
+    stats::add_elapsed(&stats::T_PARTITION, lap_start);
 
-    let t = Instant::now();
-    let isoforms: Vec<Isoform> = groups
+    let lap_start = Instant::now();
+    let isoforms: Vec<Isoform> = drafts
         .into_iter()
-        .map(|(members, alt_start, part)| {
-            let consensus =
-                consensus::refine_consensus_with_maps(reads, &members, &parts[part], &maps);
+        .map(|(members, alt_start, group_index)| {
+            let consensus = consensus::build_consensus(
+                reads,
+                &members,
+                &reads_by_group[group_index],
+                &read_maps,
+            );
             Isoform { members, consensus, alt_start }
         })
         .collect();
-    stats::add_elapsed(&stats::T_CONS, t);
+    stats::add_elapsed(&stats::T_CONS, lap_start);
 
-    collapse::collapse(isoforms, reads, &maps, cfg)
+    collapse::merge_duplicates(isoforms, reads, &read_maps, options)
 }
 
-/// Steps 1–2 and the `min_iso` filter. Each isoform, largest first, as its member read
-/// indices, whether it starts at a validated downstream start, and the index of its
-/// structure group in the second list, which holds each group's
-/// reads: they share the isoform's structure, so they may vote in its consensus.
+/// Steps 1–2 and the `min_iso` filter. Returns the drafts (isoforms that have reads but no
+/// consensus yet), largest first, each as its read indices, whether it starts at a validated
+/// downstream start, and the `group_index` of its structure group in the second list, which
+/// holds each group's reads: they share the isoform's structure, so they may vote in its
+/// consensus.
 fn partition(
     reads: &[Read],
-    maps: &[MinimizerMap],
-    cfg: &Cfg,
+    read_maps: &[MinimizerMap],
+    options: &IsoformOptions,
 ) -> (Vec<(Vec<usize>, bool, usize)>, Vec<Vec<usize>>) {
-    let mut isoforms: Vec<(Vec<usize>, bool, usize)> = Vec::new();
-    let mut parts: Vec<Vec<usize>> = Vec::new();
-    for group in &group_by_structure(reads, maps, cfg) {
-        let backbone = group[0].0;
-        let pi = parts.len();
-        parts.push(group.iter().map(|m| m.0).collect());
-        for (iso, alt_start) in ends::split_by_ends(group, reads, backbone, cfg) {
-            if iso.len() >= cfg.min_iso {
-                isoforms.push((iso, alt_start, pi));
+    let mut drafts: Vec<(Vec<usize>, bool, usize)> = Vec::new();
+    let mut reads_by_group: Vec<Vec<usize>> = Vec::new();
+    for group in &group_by_structure(reads, read_maps, options) {
+        let (backbone_idx, _, _) = group[0];
+        let group_index = reads_by_group.len();
+        reads_by_group.push(group.iter().map(|&(read_idx, _, _)| read_idx).collect());
+        for (isoform, alt_start) in ends::split_by_ends(group, reads, backbone_idx, options) {
+            if isoform.len() >= options.min_iso {
+                drafts.push((isoform, alt_start, group_index));
             }
         }
     }
-    isoforms.sort_by_key(|m| Reverse(m.0.len()));
-    (isoforms, parts)
+    drafts.sort_by_key(|(members, _, _)| Reverse(members.len()));
+    (drafts, reads_by_group)
 }
 
-/// Step 1. The first member of each group is its backbone, placed at [0, length].
+/// Step 1. The first read of each group is its backbone, placed at [0, length].
 ///
 /// One round usually takes in a whole dominant structure, because every truncated copy of
 /// the longest read fits it; only reads of other structures carry over. A cluster holding
 /// one gene therefore costs about one test per read.
-fn group_by_structure(reads: &[Read], maps: &[MinimizerMap], cfg: &Cfg) -> Vec<Vec<Member>> {
+fn group_by_structure(
+    reads: &[Read],
+    read_maps: &[MinimizerMap],
+    options: &IsoformOptions,
+) -> Vec<Vec<PlacedRead>> {
     // Longest first. Filtering keeps the order, so remaining[0] is always the next backbone.
     let mut remaining: Vec<usize> = (0..reads.len()).collect();
-    remaining.sort_by_key(|&i| Reverse(reads[i].seq.len()));
+    remaining.sort_by_key(|&read_idx| Reverse(reads[read_idx].seq.len()));
 
-    let mut groups: Vec<Vec<Member>> = Vec::new();
+    let mut groups: Vec<Vec<PlacedRead>> = Vec::new();
     while !remaining.is_empty() {
-        let bb = remaining[0];
-        let mut group: Vec<Member> = vec![(bb, 0, reads[bb].seq.len() as i32)];
+        let backbone_idx = remaining[0];
+        let mut group: Vec<PlacedRead> =
+            vec![(backbone_idx, 0, reads[backbone_idx].seq.len() as i32)];
         let mut rest: Vec<usize> = Vec::new();
-        for &r in &remaining[1..] {
-            match fit::fits_interval(&maps[r], &maps[bb], &reads[r].seq, &reads[bb].seq, cfg) {
-                Some((start, end)) => group.push((r, start, end)),
-                None => rest.push(r),
+        for &read_idx in &remaining[1..] {
+            match fit::place_on_backbone(
+                &read_maps[read_idx],
+                &read_maps[backbone_idx],
+                &reads[read_idx].seq,
+                &reads[backbone_idx].seq,
+                options,
+            ) {
+                Some((start, end)) => group.push((read_idx, start, end)),
+                None => rest.push(read_idx),
             }
         }
         groups.push(group);

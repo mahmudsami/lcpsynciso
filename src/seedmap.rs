@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Default)]
-pub struct IdHasher(u64);
+pub struct IdentityHasher(u64);
 
-impl Hasher for IdHasher {
+impl Hasher for IdentityHasher {
     #[inline]
     fn finish(&self) -> u64 {
         self.0
@@ -22,8 +22,8 @@ impl Hasher for IdHasher {
     }
 }
 
-pub type FastMap<V> = HashMap<u64, V, BuildHasherDefault<IdHasher>>;
+pub type SeedMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
 
-pub fn fmap<V>() -> FastMap<V> {
-    FastMap::default()
+pub fn new_seed_map<V>() -> SeedMap<V> {
+    SeedMap::default()
 }

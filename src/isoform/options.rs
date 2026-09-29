@@ -1,5 +1,5 @@
-//! Isoform-resolution settings: [`Cfg`], its defaults, and the command-line flags and help
-//! text that `predict` and `find-isoforms` share.
+//! Isoform-detection settings: [`IsoformOptions`], its defaults, and the command-line flags and
+//! help text that `predict` and `find-isoforms` share.
 
 /// How read starts split a structure group (`--start-split`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,14 +13,14 @@ pub enum StartSplit {
     Auto,
 }
 
-/// Settings for [`super::resolve_cluster`], grouped by the step that reads them.
+/// Settings for [`super::detect_isoforms`], grouped by the step that reads them.
 #[derive(Clone)]
-pub struct Cfg {
+pub struct IsoformOptions {
     // Minimizer anchors.
     /// Minimizer k-mer length.
-    pub k: usize,
+    pub minimizer_k: usize,
     /// Minimizer window.
-    pub w: usize,
+    pub minimizer_w: usize,
 
     // Step 1: does a read fit the backbone? (`fit.rs`)
     /// Minimum shared anchors, and minimum chain length, needed to compare two reads.
@@ -62,11 +62,11 @@ pub struct Cfg {
     pub collapse_ident: f64,
 }
 
-impl Default for Cfg {
+impl Default for IsoformOptions {
     fn default() -> Self {
-        Cfg {
-            k: 15,
-            w: 10,
+        IsoformOptions {
+            minimizer_k: 15,
+            minimizer_w: 10,
             min_anchors: 3,
             min_cov: 0.80,
             max_gap: 40,
@@ -87,16 +87,20 @@ impl Default for Cfg {
 /// Apply `flag`, if it is one of the shared isoform flags, taking its value from `next`.
 /// Returns false for any other flag. The minimizer k/w flags are named
 /// differently per subcommand, so each parses those itself.
-pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> String) -> bool {
+pub(crate) fn apply_isoform_flag(
+    options: &mut IsoformOptions,
+    flag: &str,
+    mut next: impl FnMut() -> String,
+) -> bool {
     match flag {
-        "--min-anchors" => cfg.min_anchors = next().parse().unwrap(),
-        "--min-cov" => cfg.min_cov = next().parse().unwrap(),
-        "--max-gap" => cfg.max_gap = next().parse().unwrap(),
-        "--min-gap-ident" => cfg.min_gap_ident = next().parse().unwrap(),
-        "--max-indel-run" => cfg.max_indel_run = next().parse().unwrap(),
-        "--max-flank" => cfg.max_flank = next().parse().unwrap(),
+        "--min-anchors" => options.min_anchors = next().parse().unwrap(),
+        "--min-cov" => options.min_cov = next().parse().unwrap(),
+        "--max-gap" => options.max_gap = next().parse().unwrap(),
+        "--min-gap-ident" => options.min_gap_ident = next().parse().unwrap(),
+        "--max-indel-run" => options.max_indel_run = next().parse().unwrap(),
+        "--max-flank" => options.max_flank = next().parse().unwrap(),
         "--start-split" => {
-            cfg.start_split = match next().as_str() {
+            options.start_split = match next().as_str() {
                 "on" => StartSplit::On,
                 "off" => StartSplit::Off,
                 "auto" => StartSplit::Auto,
@@ -106,21 +110,21 @@ pub(crate) fn parse_flag(cfg: &mut Cfg, flag: &str, mut next: impl FnMut() -> St
                 }
             }
         }
-        "--split-starts" => cfg.start_split = StartSplit::On,
-        "--no-split-starts" => cfg.start_split = StartSplit::Off,
-        "--peak-width" => cfg.peak_width = next().parse().unwrap(),
-        "--boundary-tol" => cfg.boundary_tol = next().parse().unwrap(),
-        "--min-iso" => cfg.min_iso = next().parse().unwrap(),
-        "--collapse-gap" => cfg.collapse_gap = next().parse().unwrap(),
-        "--collapse-ratio" => cfg.collapse_ratio = next().parse().unwrap(),
-        "--collapse-ident" => cfg.collapse_ident = next().parse().unwrap(),
+        "--split-starts" => options.start_split = StartSplit::On,
+        "--no-split-starts" => options.start_split = StartSplit::Off,
+        "--peak-width" => options.peak_width = next().parse().unwrap(),
+        "--boundary-tol" => options.boundary_tol = next().parse().unwrap(),
+        "--min-iso" => options.min_iso = next().parse().unwrap(),
+        "--collapse-gap" => options.collapse_gap = next().parse().unwrap(),
+        "--collapse-ratio" => options.collapse_ratio = next().parse().unwrap(),
+        "--collapse-ident" => options.collapse_ident = next().parse().unwrap(),
         _ => return false,
     }
     true
 }
 
-/// Help for the flags handled by [`parse_flag`], printed by both subcommands.
-pub(crate) const RESOLVE_HELP: &str = "\
+/// Help for the flags handled by [`apply_isoform_flag`], printed by both subcommands.
+pub(crate) const ISOFORM_HELP: &str = "\
 STRUCTURE (each read is tested against the longest unassigned read of its cluster):
     --min-iso N             min reads for a reported isoform             [3]
     --min-anchors N         min collinear anchors to trust an alignment  [3]

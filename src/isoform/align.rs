@@ -1,11 +1,11 @@
 //! Sequence comparison with block-aligner (SIMD, adaptive block size).
 //!
-//!   * [`flank`]: how much of a read's terminal flank the reference accounts for. An x-drop
+//!   * [`extend_flank`]: how much of a read's terminal flank the backbone accounts for. An x-drop
 //!     extension stops where the sequences stop agreeing, so the unaligned rest of the read
-//!     is the unmatched flank, and whether the reference ran out tells an overhang from a
+//!     is the unmatched flank, and whether the backbone ran out tells an overhang from a
 //!     divergence.
-//!   * [`gap_runs`]: global alignment of an interior gap pinned between two anchors, read as
-//!     substitution identity and longest indel.
+//!   * [`align_global`]: global alignment of two sequences (an interior gap pinned between two
+//!     anchors, or whole consensuses), read as substitution identity and longest indel.
 //!
 //! Buffers are thread-local and reused, since these run millions of times.
 
@@ -17,9 +17,9 @@ use block_aligner::scores::*;
 
 /// Match +1, mismatch -1. The match score must be positive, or an x-drop extension could
 /// never gain score and would stop immediately.
-static SW: NucMatrix = NucMatrix::new_simple(1, -1);
+static NUC_SCORES: NucMatrix = NucMatrix::new_simple(1, -1);
 /// Affine gaps; block-aligner requires opening a gap to cost more than extending it.
-const GAPS: Gaps = Gaps { open: -2, extend: -1 };
+const GAP_PENALTIES: Gaps = Gaps { open: -2, extend: -1 };
 
 /// Block size range for the adaptive aligner.
 const BS_LO: usize = 32;
@@ -44,7 +44,7 @@ impl Bufs {
     }
 
     /// Make room for a query of `lq` and a reference of `lr` bases.
-    fn fit(&mut self, lq: usize, lr: usize) {
+    fn ensure_capacity(&mut self, lq: usize, lr: usize) {
         if lq > self.cap_q {
             self.cap_q = (lq * 2).max(BS_HI);
             self.q = PaddedBytes::new::<NucMatrix>(self.cap_q, BS_HI);
@@ -62,62 +62,66 @@ thread_local! {
     static CIGAR: RefCell<(Cigar, usize)> = RefCell::new((Cigar::new(BS_HI, BS_HI), BS_HI));
 }
 
-/// Result of extending a read flank into the reference flank.
+/// Result of extending a read flank into the backbone flank.
 pub struct FlankFit {
-    /// Read-flank bases the reference does not account for.
+    /// Read-flank bases the backbone does not account for.
     pub unmatched: usize,
-    /// Reference bases consumed by the alignment.
-    pub consumed: usize,
-    /// The reference flank ran out: the read extends past it (an overhang). False means the
-    /// alignment stopped while reference sequence remained (the sequences diverge).
-    pub reference_exhausted: bool,
+    /// Backbone bases consumed by the alignment.
+    pub backbone_consumed: usize,
+    /// The backbone flank ran out: the read extends past it (an overhang). False means the
+    /// alignment stopped while backbone sequence remained (the sequences diverge).
+    pub backbone_exhausted: bool,
 }
 
-/// Extend read flank `read` into reference flank `reference`, outward from their anchor. With
-/// `rev`, both are aligned reversed, so a 5' flank also starts at the anchor.
-pub fn flank(read: &[u8], reference: &[u8], rev: bool) -> FlankFit {
+/// Extend read flank `read` into backbone flank `backbone_flank`, outward from their anchor.
+/// With `reversed`, both are aligned reversed, so a 5' flank also starts at the anchor.
+pub fn extend_flank(read: &[u8], backbone_flank: &[u8], reversed: bool) -> FlankFit {
     if read.is_empty() {
-        return FlankFit { unmatched: 0, consumed: 0, reference_exhausted: reference.is_empty() };
+        return FlankFit {
+            unmatched: 0,
+            backbone_consumed: 0,
+            backbone_exhausted: backbone_flank.is_empty(),
+        };
     }
-    if reference.is_empty() {
-        return FlankFit { unmatched: read.len(), consumed: 0, reference_exhausted: true };
+    if backbone_flank.is_empty() {
+        return FlankFit { unmatched: read.len(), backbone_consumed: 0, backbone_exhausted: true };
     }
     BUFS.with(|b| {
         let b = &mut *b.borrow_mut();
-        b.fit(read.len(), reference.len());
-        if rev {
+        b.ensure_capacity(read.len(), backbone_flank.len());
+        if reversed {
             b.q.set_bytes_rev::<NucMatrix>(read, BS_HI);
-            b.r.set_bytes_rev::<NucMatrix>(reference, BS_HI);
+            b.r.set_bytes_rev::<NucMatrix>(backbone_flank, BS_HI);
         } else {
             b.q.set_bytes::<NucMatrix>(read, BS_HI);
-            b.r.set_bytes::<NucMatrix>(reference, BS_HI);
+            b.r.set_bytes::<NucMatrix>(backbone_flank, BS_HI);
         }
         // X-drop scaled to the flank: too small cuts a real match short, too large walks
         // through divergent sequence.
         let xdrop = ((read.len() / 4) as i32).max(20);
-        let mut blk = Block::<false, true>::new(read.len(), reference.len(), BS_HI);
-        blk.align(&b.q, &b.r, &SW, GAPS, BS_LO..=BS_HI, xdrop);
+        let mut blk = Block::<false, true>::new(read.len(), backbone_flank.len(), BS_HI);
+        blk.align(&b.q, &b.r, &NUC_SCORES, GAP_PENALTIES, BS_LO..=BS_HI, xdrop);
         let res = blk.res();
         FlankFit {
             unmatched: read.len().saturating_sub(res.query_idx),
-            consumed: res.reference_idx.min(reference.len()),
-            reference_exhausted: res.reference_idx >= reference.len(),
+            backbone_consumed: res.reference_idx.min(backbone_flank.len()),
+            backbone_exhausted: res.reference_idx >= backbone_flank.len(),
         }
     })
 }
 
-/// Global alignment of `q` against `r` with traceback. `read_trace` gets the trace, the
+/// Global alignment of `q` against `r` with traceback. `on_trace` gets the trace, the
 /// padded query and reference, the alignment result, and the reusable CIGAR buffer.
-fn traced_global<T>(
+fn with_global_trace<T>(
     q: &[u8],
     r: &[u8],
-    read_trace: impl FnOnce(&Trace, &PaddedBytes, &PaddedBytes, AlignResult, &mut Cigar) -> T,
+    on_trace: impl FnOnce(&Trace, &PaddedBytes, &PaddedBytes, AlignResult, &mut Cigar) -> T,
 ) -> T {
     BUFS.with(|bf| {
         CIGAR.with(|cg| {
             let bf = &mut *bf.borrow_mut();
             let (cigar, cap) = &mut *cg.borrow_mut();
-            bf.fit(q.len(), r.len());
+            bf.ensure_capacity(q.len(), r.len());
             bf.q.set_bytes::<NucMatrix>(q, BS_HI);
             bf.r.set_bytes::<NucMatrix>(r, BS_HI);
             // `Cigar::new` sizes for query + reference, so grow it when needed.
@@ -127,50 +131,50 @@ fn traced_global<T>(
                 *cigar = Cigar::new(*cap, *cap);
             }
             let mut blk = Block::<true, false>::new(q.len(), r.len(), BS_HI);
-            blk.align(&bf.q, &bf.r, &SW, GAPS, BS_LO..=BS_HI, 0);
+            blk.align(&bf.q, &bf.r, &NUC_SCORES, GAP_PENALTIES, BS_LO..=BS_HI, 0);
             let res = blk.res();
-            read_trace(blk.trace(), &bf.q, &bf.r, res, cigar)
+            on_trace(blk.trace(), &bf.q, &bf.r, res, cigar)
         })
     })
 }
 
-/// Summary of a global alignment between two interior gaps.
-pub struct GapStats {
+/// Summary of a global alignment of two sequences.
+pub struct AlignStats {
     /// Longest single run of inserted or deleted bases.
-    pub max_indel: usize,
+    pub longest_indel: usize,
     /// Matching columns.
     pub eq: usize,
     /// Mismatching columns.
     pub mismatch: usize,
 }
 
-impl GapStats {
+impl AlignStats {
     /// Identity over aligned columns only, Eq / (Eq + X). Indel columns are excluded, so a
-    /// length difference does not lower it; `max_indel` reports that separately.
+    /// length difference does not lower it; `longest_indel` reports that separately.
     pub fn ident(&self) -> f64 {
         let d = self.eq + self.mismatch;
         if d == 0 { 1.0 } else { self.eq as f64 / d as f64 }
     }
 }
 
-/// Align two interior gaps globally and summarise the alignment.
-pub fn gap_runs(a: &[u8], b: &[u8]) -> GapStats {
+/// Align two sequences globally and summarise the alignment.
+pub fn align_global(a: &[u8], b: &[u8]) -> AlignStats {
     if a.is_empty() || b.is_empty() {
-        return GapStats { max_indel: a.len().max(b.len()), eq: 0, mismatch: 0 };
+        return AlignStats { longest_indel: a.len().max(b.len()), eq: 0, mismatch: 0 };
     }
-    traced_global(a, b, |trace, q, r, res, cigar| {
+    with_global_trace(a, b, |trace, q, r, res, cigar| {
         // `cigar_eq` separates matches (=) from mismatches (X); plain `cigar` merges them as M.
         trace.cigar_eq(q, r, res.query_idx, res.reference_idx, cigar);
-        let (mut max_indel, mut eq, mut mismatch) = (0, 0, 0);
+        let (mut longest_indel, mut eq, mut mismatch) = (0, 0, 0);
         for i in 0..cigar.len() {
             let op = cigar.get(i);
             match op.op {
                 Operation::Eq => eq += op.len,
                 Operation::X => mismatch += op.len,
-                Operation::I | Operation::D => max_indel = max_indel.max(op.len),
+                Operation::I | Operation::D => longest_indel = longest_indel.max(op.len),
                 _ => {}
             }
         }
-        GapStats { max_indel, eq, mismatch }
+        AlignStats { longest_indel, eq, mismatch }
     })
 }
