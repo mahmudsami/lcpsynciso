@@ -95,6 +95,21 @@ pub(crate) fn informative_seeds(counts: &SeedCounts, min_occ: u32, max_occ: u32)
     informative
 }
 
+/// The `max_occ` actually used: `max_occ`, or `max_occ_frac` of the reads if that is larger,
+/// so the cap grows with the input instead of staying fixed for very large read sets.
+pub(crate) fn effective_max_occ(max_occ: u32, max_occ_frac: f64, n_reads: usize) -> u32 {
+    let scaled = (max_occ_frac * n_reads as f64).min(u32::MAX as f64) as u32;
+    max_occ.max(scaled)
+}
+
+/// Exit with a message unless `--max-occ-frac` is a fraction in [0, 1].
+pub(crate) fn check_max_occ_frac(max_occ_frac: f64) {
+    if !(0.0..=1.0).contains(&max_occ_frac) {
+        eprintln!("--max-occ-frac must be in [0, 1] (got {max_occ_frac})");
+        std::process::exit(2);
+    }
+}
+
 /// A read's informative seeds with their vote weights. `level_weights[i]` is the weight of
 /// level `i + 1`; levels beyond it weigh their level number.
 pub(crate) fn weighted_seeds(
@@ -324,6 +339,8 @@ pub struct Config {
     pub levels: usize,
     pub min_occ: u32,
     pub max_occ: u32,
+    /// Raise `max_occ` to this fraction of the reads when that is larger.
+    pub max_occ_frac: f64,
     /// Total vote weight needed to join a cluster.
     pub min_shared: u32,
     /// ... and the fraction of the read's total seed weight it must also reach.
@@ -347,6 +364,7 @@ impl Default for Config {
             levels: 3,
             min_occ: 2,
             max_occ: 100_000,
+            max_occ_frac: 0.01,
             min_shared: 3,
             min_shared_frac: 0.10,
             level_weights: vec![1, 2, 5],
@@ -378,6 +396,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--levels" => config.levels = next().parse().unwrap(),
             "--min-occ" => config.min_occ = next().parse().unwrap(),
             "--max-occ" => config.max_occ = next().parse().unwrap(),
+            "--max-occ-frac" => config.max_occ_frac = next().parse().unwrap(),
             "--min-shared" => config.min_shared = next().parse().unwrap(),
             "--min-shared-frac" => config.min_shared_frac = next().parse().unwrap(),
             "--level-weights" => {
@@ -410,6 +429,7 @@ pub fn parse_args(argv: &[String]) -> Config {
     if config.seed_t == usize::MAX {
         config.seed_t = (config.seed_k - config.seed_s) / 2;
     }
+    check_max_occ_frac(config.max_occ_frac);
     config
 }
 
@@ -427,6 +447,7 @@ OPTIONS:
     --levels N       use seeds from levels L1..N               [3]
     --min-occ N      keep seed if it occurs in >= N reads      [2]
     --max-occ N      ... and in <= N reads                     [100000]
+    --max-occ-frac F ... or in <= F x reads, if that is more   [0.01]
     --level-weights a,b,c   per-level vote weights (L1,L2,..)  [1,2,5]
     --min-shared N   join a cluster if weighted shared >= N    [3]
     --min-shared-frac F  ... and >= F of the read's seed weight [0.1]
@@ -438,7 +459,7 @@ OPTIONS:
     );
 }
 
-pub fn run(config: Config) {
+pub fn run(mut config: Config) {
     if config.threads > 0 {
         rayon::ThreadPoolBuilder::new().num_threads(config.threads).build_global().ok();
     }
@@ -454,6 +475,8 @@ pub fn run(config: Config) {
         load_reads(&config.reads_path, config.batch_size, config.max_reads, params, "cluster");
     let n_reads = store.len() as u64;
     let n_distinct_seeds = counts.len();
+    // From here on `max_occ` is the cap in use, so the log and summary.tsv report it.
+    config.max_occ = effective_max_occ(config.max_occ, config.max_occ_frac, store.len());
     let informative = informative_seeds(&counts, config.min_occ, config.max_occ);
     drop(counts);
     let n_informative_seeds = informative.len();
@@ -558,8 +581,8 @@ fn write_outputs(
         config.seed_k, config.seed_s, config.levels
     ));
     summary.push_str(&format!(
-        "min_occ\t{}\nmax_occ\t{}\nmin_shared\t{}\nmin_shared_frac\t{}\n",
-        config.min_occ, config.max_occ, config.min_shared, config.min_shared_frac
+        "min_occ\t{}\nmax_occ\t{}\nmax_occ_frac\t{}\nmin_shared\t{}\nmin_shared_frac\t{}\n",
+        config.min_occ, config.max_occ, config.max_occ_frac, config.min_shared, config.min_shared_frac
     ));
     summary.push_str(&format!(
         "level_weights\t{}\n",
@@ -613,9 +636,22 @@ mod tests {
     use rayon::prelude::*;
 
     use super::{
-        cluster_reads, count_seeds, informative_seeds, GreedyClusterer, LengthRanks, SeedParams,
+        cluster_reads, count_seeds, effective_max_occ, informative_seeds, GreedyClusterer,
+        LengthRanks, SeedParams,
     };
     use crate::read_store::ReadStore;
+
+    #[test]
+    fn max_occ_is_the_larger_of_the_floor_and_the_read_fraction() {
+        // Small inputs keep the fixed floor.
+        assert_eq!(effective_max_occ(100_000, 0.01, 20_000), 100_000);
+        assert_eq!(effective_max_occ(100_000, 0.01, 10_000_000), 100_000);
+        // Large inputs scale with the read count.
+        assert_eq!(effective_max_occ(100_000, 0.01, 13_839_533), 138_395);
+        assert_eq!(effective_max_occ(100_000, 0.05, 13_839_533), 691_976);
+        // A fraction of 0 turns the scaling off.
+        assert_eq!(effective_max_occ(100_000, 0.0, 13_839_533), 100_000);
+    }
 
     /// A fixed pseudo-random sequence, so seeds are unique and well spread.
     fn random_seq(n: usize, seed: u64) -> Vec<u8> {
