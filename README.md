@@ -67,7 +67,9 @@ left out of `isoform_assignments.tsv`.
 ## How it works
 
 **Clustering.** Seeds are LCP-syncmer block hashes from several levels. Only seeds found
-in between `--min-occ` and `--max-occ` reads are used. Reads are clustered greedily,
+in between `--min-occ` and `--max-occ` reads are used; for large inputs the upper cap
+rises to `--max-occ-frac` of the reads (default 0.01) when that is more than `--max-occ`,
+e.g. 138,395 for 13.8M reads. Reads are clustered greedily,
 longest read first (ties in file order), so each cluster is seeded by its most complete
 read; `predict` and `cluster` share this step. Each seed already claimed by a cluster
 votes for it, weighted by the seed's level. A read joins the winning cluster if its votes

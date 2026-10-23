@@ -21,7 +21,10 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::cluster::{cluster_reads, informative_seeds, load_reads, GreedyClusterer, SeedParams};
+use crate::cluster::{
+    check_max_occ_frac, cluster_reads, effective_max_occ, informative_seeds, load_reads,
+    GreedyClusterer, SeedParams,
+};
 use crate::isoform::{
     self, apply_isoform_flag, ClusterRecords, OutputFiles, Read, IsoformOptions, ISOFORM_HELP,
 };
@@ -40,6 +43,7 @@ pub struct Config {
     pub levels: usize,
     pub min_occ: u32,
     pub max_occ: u32,
+    pub max_occ_frac: f64,
     pub min_shared: u32,
     pub min_shared_frac: f64,
     pub level_weights: Vec<u32>,
@@ -66,6 +70,7 @@ impl Default for Config {
             levels: 3,
             min_occ: 2,
             max_occ: 100_000,
+            max_occ_frac: 0.01,
             min_shared: 3,
             min_shared_frac: 0.10,
             level_weights: vec![1, 2, 5],
@@ -100,6 +105,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--levels" => config.levels = next().parse().unwrap(),
             "--min-occ" => config.min_occ = next().parse().unwrap(),
             "--max-occ" => config.max_occ = next().parse().unwrap(),
+            "--max-occ-frac" => config.max_occ_frac = next().parse().unwrap(),
             "--min-shared" => config.min_shared = next().parse().unwrap(),
             "--min-shared-frac" => config.min_shared_frac = next().parse().unwrap(),
             "--level-weights" => {
@@ -134,6 +140,7 @@ pub fn parse_args(argv: &[String]) -> Config {
     if config.seed_t == usize::MAX {
         config.seed_t = (config.seed_k - config.seed_s) / 2;
     }
+    check_max_occ_frac(config.max_occ_frac);
     config
 }
 
@@ -157,6 +164,7 @@ CLUSTERING (seeds):
     --levels N              use seeds from levels L1..N                  [3]
     --min-occ N             keep seed if it occurs in >= N reads         [2]
     --max-occ N             ... and in <= N reads                        [100000]
+    --max-occ-frac F        ... or in <= F x reads, if that is more      [0.01]
     --level-weights a,b,c   per-level vote weights                       [1,2,5]
     --min-shared N          join a cluster if weighted shared >= N       [3]
     --min-shared-frac F     ... and >= F of the read's seed weight       [0.1]
@@ -197,13 +205,16 @@ pub fn run(config: Config) {
         load_reads(&config.reads_path, config.batch_size, config.max_reads, seed_params, "predict");
     let n_reads = store.len();
     let n_distinct_seeds = counts.len();
-    let informative = informative_seeds(&counts, config.min_occ, config.max_occ);
+    let max_occ = effective_max_occ(config.max_occ, config.max_occ_frac, n_reads);
+    let informative = informative_seeds(&counts, config.min_occ, max_occ);
     drop(counts);
     let phase_a_time = run_start.elapsed();
     eprintln!(
-        "[predict] {} reads, distinct seeds={}, informative={}",
+        "[predict] {} reads, distinct seeds={}, informative (in [{},{}])={}",
         n_reads,
         n_distinct_seeds,
+        config.min_occ,
+        max_occ,
         informative.len()
     );
     eprintln!(
