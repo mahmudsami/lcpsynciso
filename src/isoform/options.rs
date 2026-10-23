@@ -73,7 +73,7 @@ impl Default for IsoformOptions {
             min_gap_ident: 0.80,
             max_indel_run: 4,
             max_flank: 25,
-            start_split: StartSplit::On,
+            start_split: StartSplit::Auto,
             peak_width: 10,
             boundary_tol: 150,
             min_iso: 3,
@@ -141,7 +141,7 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
 
 READ ENDS (a structure group splits into isoforms by where its reads start and end):
     --start-split on|off|auto
-                            how read starts split a group: on = every    [on]
+                            how read starts split a group: on = every    [auto]
                             start peak; off = only 3' ends split, and a read
                             reaching further 5' than an isoform joins it;
                             auto = off, plus a downstream start that looks like
