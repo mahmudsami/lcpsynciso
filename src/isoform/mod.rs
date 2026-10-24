@@ -40,7 +40,7 @@ pub(crate) mod stats; // diagnostic counters
 
 use anchors::MinimizerMap;
 pub use find_isoforms::{parse_args, run, print_usage, Config};
-pub use options::{IsoformOptions, StartSplit};
+pub use options::{AltStarts, EndMerge, IsoformOptions, StartSplit};
 pub(crate) use options::{apply_isoform_flag, ISOFORM_HELP};
 pub(crate) use output::{format_cluster_records, OutputFiles, ClusterRecords};
 
