@@ -21,19 +21,12 @@
 //!
 //! Two switches change containment (defaults keep the behaviour above):
 //!   * `--alt-starts keep`: an isoform at a validated start never merges into one it lies
-//!     inside (by default only the larger of a pair is protected), unless its start lies
-//!     within `alt_start_min_dist` of the other's: the same transcription start site. The
-//!     larger isoform's protection is unchanged;
+//!     inside (by default only the larger of a pair is protected);
 //!   * `--end-merge polya`: a pair differing only at the 3' end is decided by internal
 //!     priming instead of read counts. HiFi FLNC reads end at a polyA tail, so an earlier 3'
 //!     end is either a real polyA site or the oligo-dT primer annealed to an A-rich stretch;
 //!     the longer isoform holds the sequence just past that end, so an A-rich window there
-//!     merges the pair and anything else keeps both. Ends within `end_merge_dist` bp are the
-//!     same polyA site and always merge.
-//!
-//! A pair merged as the same polyA site keeps the larger isoform's consensus, so its majority
-//! end survives; rebuilding from the longest read would move it to a minority's end a few bp
-//! away.
+//!     merges the pair and anything else keeps both.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -155,11 +148,6 @@ fn decide_merge(
     // differs at the 5' end stays apart when either is one.
     let end_slack = options.collapse_gap as i32;
     let either_alt_start = small.alt_start || big.alt_start;
-    // With `AltStarts::Keep`, how far a smaller isoform's validated start must lie inside the
-    // larger one to keep it apart; nearer, it is the same transcription start site. Only this
-    // case uses it: a larger isoform at a validated start is kept apart as before.
-    let alt_sep = end_slack.max(options.alt_start_min_dist as i32);
-    let same_site = options.end_merge_dist as i32;
     if small.consensus.len() <= big.consensus.len() {
         // `small` placed on `big`; it may overhang `big`'s 5' end (a negative start).
         match place_on_backbone(small_map, big_map, &small.consensus, &big.consensus, strict) {
@@ -178,16 +166,13 @@ fn decide_merge(
                 }
             }
             Some((start, _))
-                if options.alt_starts == AltStarts::Keep && small.alt_start && start > alt_sep =>
+                if options.alt_starts == AltStarts::Keep && small.alt_start && start > end_slack =>
             {
                 MergeDecision::KeepSeparate
             }
             Some((_, end)) if polya && end < big.consensus.len() as i32 - end_slack => {
-                // `small` ends early: the same polyA site if within `same_site` bp, else
-                // internal priming if `big` is A-rich just past its end.
-                if big.consensus.len() as i32 - end <= same_site
-                    || internally_primed(&big.consensus, end, options)
-                {
+                // `small` ends early: internal priming if `big` is A-rich just past its end.
+                if internally_primed(&big.consensus, end, options) {
                     MergeDecision::Merge
                 } else {
                     MergeDecision::KeepSeparate
@@ -197,41 +182,27 @@ fn decide_merge(
             Some(_) => MergeDecision::KeepSeparate,
         }
     } else {
-        // `big` placed on `small`: `small` extends it at the 5' end, the 3' end, or both. A 3'
-        // extension within `same_site` bp is the same polyA site, and `big` keeps its consensus
-        // (its majority end); a longer extension makes `small` a more complete copy, so the
-        // consensus is rebuilt.
+        // `big` placed on `small`: `small` extends it at the 5' end, the 3' end, or both.
         match place_on_backbone(big_map, small_map, &big.consensus, &small.consensus, strict) {
             None => MergeDecision::KeepSeparate,
             Some((start, _)) if start > end_slack && either_alt_start => {
                 MergeDecision::KeepSeparate
             }
-            Some((start, end)) => {
-                let extends_5 = start > end_slack;
-                let extends_3 = end < small.consensus.len() as i32 - end_slack;
-                if polya && extends_3 {
-                    // `big` ends early: internal priming if `small` is A-rich just past its
-                    // end; the same polyA site if within `same_site` bp; else a real end.
-                    if internally_primed(&small.consensus, end, options) {
-                        return MergeDecision::MergeAndRebuild;
-                    }
-                    if small.consensus.len() as i32 - end > same_site {
-                        return MergeDecision::KeepSeparate;
-                    }
-                    return match (extends_5, within_ratio) {
-                        (false, _) => MergeDecision::Merge,
-                        (true, true) => MergeDecision::MergeAndRebuild,
-                        (true, false) => MergeDecision::KeepSeparate,
-                    };
-                }
-                if !within_ratio {
-                    MergeDecision::KeepSeparate
-                } else if extends_5 || extends_3 {
+            Some((_, end)) if polya && end < small.consensus.len() as i32 - end_slack => {
+                // `big` ends early: internal priming if `small` is A-rich just past its end.
+                if internally_primed(&small.consensus, end, options) {
                     MergeDecision::MergeAndRebuild
                 } else {
-                    MergeDecision::Merge
+                    MergeDecision::KeepSeparate
                 }
             }
+            Some(_) if !within_ratio => MergeDecision::KeepSeparate,
+            Some((start, end))
+                if start > end_slack || end < small.consensus.len() as i32 - end_slack =>
+            {
+                MergeDecision::MergeAndRebuild
+            }
+            Some(_) => MergeDecision::Merge,
         }
     }
 }
@@ -433,24 +404,5 @@ mod tests {
         assert_eq!(merge_case(&seqs, &[8, 10], &[false, false], &polya), vec![(18, 2000)]);
         let ratio = IsoformOptions::default();
         assert_eq!(merge_case(&seqs, &[10, 8], &[false, false], &ratio).len(), 2);
-    }
-
-    #[test]
-    fn nearby_starts_and_ends_are_one_site() {
-        let truth = random_seq(2000, 9);
-        // a validated start 40 bp downstream: the same TSS, merges with --alt-starts keep
-        let keep = IsoformOptions { alt_starts: AltStarts::Keep, ..IsoformOptions::default() };
-        let seqs = [truth.clone(), truth[40..].to_vec()];
-        assert_eq!(merge_case(&seqs, &[12, 4], &[false, true], &keep), vec![(16, 2000)]);
-        // ... but a larger isoform at a validated start stays apart, as without --alt-starts
-        let merge = IsoformOptions::default();
-        assert_eq!(merge_case(&seqs, &[4, 12], &[false, true], &merge), vec![(12, 1960), (4, 2000)]);
-        assert_eq!(merge_case(&seqs, &[4, 12], &[false, true], &keep), vec![(12, 1960), (4, 2000)]);
-        // 3' ends 20 bp apart without an A-rich stretch: the same polyA site, merges with polya
-        let polya = IsoformOptions { end_merge: EndMerge::Polya, ..IsoformOptions::default() };
-        let seqs = [truth.clone(), truth[..1980].to_vec()];
-        assert_eq!(merge_case(&seqs, &[10, 8], &[false, false], &polya), vec![(18, 2000)]);
-        // the majority's end is kept, not the minority's 20 bp further on
-        assert_eq!(merge_case(&seqs, &[8, 10], &[false, false], &polya), vec![(18, 1980)]);
     }
 }

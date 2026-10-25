@@ -86,13 +86,6 @@ pub struct IsoformOptions {
     pub alt_starts: AltStarts,
     /// How isoforms that differ only at the 3' end are merged.
     pub end_merge: EndMerge,
-    /// With `AltStarts::Keep`: a smaller isoform's validated start this close (bp) to the
-    /// larger isoform's start is the same transcription start site (a broad promoter), so the
-    /// pair merges as usual.
-    pub alt_start_min_dist: u32,
-    /// With `EndMerge::Polya`: 3' ends this close (bp) are the same polyA site (cleavage
-    /// varies by a few bp), so the pair merges whatever the A content.
-    pub end_merge_dist: u32,
     /// With `EndMerge::Polya`: bases past the earlier 3' end that are tested for A content.
     pub priming_window: usize,
     /// With `EndMerge::Polya`: A fraction of that window that means internal priming.
@@ -119,8 +112,6 @@ impl Default for IsoformOptions {
             collapse_ident: 0.98,
             alt_starts: AltStarts::Merge,
             end_merge: EndMerge::Ratio,
-            alt_start_min_dist: 50,
-            end_merge_dist: 30,
             priming_window: 20,
             priming_a_frac: 0.6,
         }
@@ -181,8 +172,6 @@ pub(crate) fn apply_isoform_flag(
                 }
             }
         }
-        "--alt-start-min-dist" => options.alt_start_min_dist = next().parse().unwrap(),
-        "--end-merge-dist" => options.end_merge_dist = next().parse().unwrap(),
         "--priming-window" => options.priming_window = next().parse().unwrap(),
         "--priming-a-frac" => options.priming_a_frac = next().parse().unwrap(),
         _ => return false,
@@ -229,15 +218,10 @@ MERGING (near-identical isoforms, after consensus):
                             regardless of --collapse-ratio
     --alt-starts merge|keep whether an isoform at a validated start may  [merge]
                             merge into one it lies inside (keep: never)
-    --alt-start-min-dist N  keep: a smaller isoform's validated start   [50]
-                            within N bp of the larger's start is the same TSS
-                            and merges as usual
     --end-merge ratio|polya isoforms differing only at the 3' end: ratio [ratio]
                             = merge by --collapse-ratio; polya = merge the
                             earlier end, whatever the read counts, only if the
                             longer isoform is A-rich just past it (internal
                             priming), else keep both
-    --end-merge-dist N      polya: 3' ends within N bp are the same     [30]
-                            polyA site and always merge
     --priming-window N      bases past the earlier end tested (polya)    [20]
     --priming-a-frac F      A fraction there meaning internal priming    [0.6]";
