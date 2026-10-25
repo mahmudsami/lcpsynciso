@@ -21,7 +21,7 @@
 //!     their own. The full-length isoform is kept either way, so a wrong call costs an extra
 //!     isoform, never the complete sequence.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::{stats, PlacedRead, Read, IsoformOptions, StartSplit};
 
@@ -84,7 +84,9 @@ pub(super) fn split_by_ends(
         _ => None,
     };
 
-    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    // Ordered maps throughout: which isoform a tied read joins, and the order isoforms reach
+    // merging, then do not depend on hashing, so the output is the same on every run.
+    let mut cells: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
     for group_pos in 0..group.len() {
         if let Some(key) = key_of(group_pos) {
             cells.entry(key).or_default().push(group_pos);
@@ -95,7 +97,7 @@ pub(super) fn split_by_ends(
     // the q-th smallest start and q-th largest end, not the median, so that the containment
     // test below admits every read that belongs. q stays well below the cell size; at
     // q = min_iso a minimal cell would shrink to its reads' intersection.
-    let mut isoform_extents: HashMap<(i32, i32), (i32, i32, usize)> = HashMap::new();
+    let mut isoform_extents: BTreeMap<(i32, i32), (i32, i32, usize)> = BTreeMap::new();
     for (key, group_positions) in &cells {
         if group_positions.len() >= options.min_iso {
             let mut starts: Vec<i32> =
@@ -114,7 +116,7 @@ pub(super) fn split_by_ends(
         return vec![(group.iter().map(|&(read_idx, _, _)| read_idx).collect(), false)];
     }
 
-    let mut reads_by_isoform: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let mut reads_by_isoform: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
     for (group_pos, &(read_idx, start, end)) in group.iter().enumerate() {
         if let Some(key) = key_of(group_pos) {
             if isoform_extents.contains_key(&key) {
