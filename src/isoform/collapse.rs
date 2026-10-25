@@ -18,13 +18,22 @@
 //! kept isoform's consensus is rebuilt from all its reads, so the full-length sequence survives.
 //! Containment treats an indel of more than `collapse_gap` bp as a difference, as the
 //! near-identity test does.
+//!
+//! Two switches change containment:
+//!   * `--alt-starts keep` (the default): an isoform at a validated start never merges into
+//!     one it lies inside; with `merge`, only the larger of a pair is protected;
+//!   * `--end-merge polya`: a pair differing only at the 3' end is decided by internal
+//!     priming instead of read counts. HiFi FLNC reads end at a polyA tail, so an earlier 3'
+//!     end is either a real polyA site or the oligo-dT primer annealed to an A-rich stretch;
+//!     the longer isoform holds the sequence just past that end, so an A-rich window there
+//!     merges the pair and anything else keeps both.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::anchors::{minimizer_map, MinimizerMap};
 use super::fit::{place_on_backbone, strip_homopolymer_ends};
-use super::{align, consensus, Isoform, Read, IsoformOptions};
+use super::{align, consensus, AltStarts, EndMerge, Isoform, IsoformOptions, Read};
 
 /// Merge duplicate isoforms among `isoforms`, whose members index `reads` (with minimizer maps
 /// `read_maps`, used to rebuild a consensus).
@@ -125,7 +134,12 @@ fn decide_merge(
     if consensuses_near_identical(small, big, options) {
         return MergeDecision::Merge;
     }
-    if small.members.len() as f64 > options.collapse_ratio * big.members.len() as f64 {
+    // With `EndMerge::Polya`, a pair differing only at the 3' end is decided by internal
+    // priming whatever the read counts, so containment is tested even past the ratio.
+    let polya = options.end_merge == EndMerge::Polya;
+    let within_ratio =
+        small.members.len() as f64 <= options.collapse_ratio * big.members.len() as f64;
+    if !within_ratio && !polya {
         return MergeDecision::KeepSeparate;
     }
     // Containment, testing the shorter consensus against the longer. An end reaching more
@@ -138,10 +152,12 @@ fn decide_merge(
         // `small` placed on `big`; it may overhang `big`'s 5' end (a negative start).
         match place_on_backbone(small_map, big_map, &small.consensus, &big.consensus, strict) {
             None => MergeDecision::KeepSeparate,
+            Some(_) if !within_ratio && !polya => MergeDecision::KeepSeparate,
             Some((start, end)) if start < -end_slack => {
                 // Same 3' end: `small` is `big` with its 5' end intact. Otherwise the two
                 // differ at both ends and stay apart.
-                if !either_alt_start
+                if within_ratio
+                    && !either_alt_start
                     && end >= big.consensus.len() as i32 - options.boundary_tol as i32
                 {
                     MergeDecision::MergeAndRebuild
@@ -149,7 +165,21 @@ fn decide_merge(
                     MergeDecision::KeepSeparate
                 }
             }
-            Some(_) => MergeDecision::Merge,
+            Some((start, _))
+                if options.alt_starts == AltStarts::Keep && small.alt_start && start > end_slack =>
+            {
+                MergeDecision::KeepSeparate
+            }
+            Some((_, end)) if polya && end < big.consensus.len() as i32 - end_slack => {
+                // `small` ends early: internal priming if `big` is A-rich just past its end.
+                if internally_primed(&big.consensus, end, options) {
+                    MergeDecision::Merge
+                } else {
+                    MergeDecision::KeepSeparate
+                }
+            }
+            Some(_) if within_ratio => MergeDecision::Merge,
+            Some(_) => MergeDecision::KeepSeparate,
         }
     } else {
         // `big` placed on `small`: `small` extends it at the 5' end, the 3' end, or both.
@@ -158,6 +188,15 @@ fn decide_merge(
             Some((start, _)) if start > end_slack && either_alt_start => {
                 MergeDecision::KeepSeparate
             }
+            Some((_, end)) if polya && end < small.consensus.len() as i32 - end_slack => {
+                // `big` ends early: internal priming if `small` is A-rich just past its end.
+                if internally_primed(&small.consensus, end, options) {
+                    MergeDecision::MergeAndRebuild
+                } else {
+                    MergeDecision::KeepSeparate
+                }
+            }
+            Some(_) if !within_ratio => MergeDecision::KeepSeparate,
             Some((start, end))
                 if start > end_slack || end < small.consensus.len() as i32 - end_slack =>
             {
@@ -166,6 +205,19 @@ fn decide_merge(
             Some(_) => MergeDecision::Merge,
         }
     }
+}
+
+/// Whether the 3' end at `end` of a shorter isoform, placed on `longer`, looks like internal
+/// priming: the oligo-dT primer annealed to an A-rich stretch of the transcript, which
+/// `longer` holds just past `end`.
+fn internally_primed(longer: &[u8], end: i32, options: &IsoformOptions) -> bool {
+    let from = (end.max(0) as usize).min(longer.len());
+    let window = &longer[from..(from + options.priming_window).min(longer.len())];
+    if window.is_empty() {
+        return false;
+    }
+    let a = window.iter().filter(|&&b| b == b'A' || b == b'a').count();
+    a as f64 >= options.priming_a_frac * window.len() as f64
 }
 
 /// Near-identical consensuses, ignoring homopolymer ends: identity at least `collapse_ident`,
@@ -290,5 +342,67 @@ mod tests {
         let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].consensus, truth);
+    }
+
+    /// Isoforms of `counts[i]` identical reads with consensus `seqs[i]`, run through merging;
+    /// returns (reads, consensus length) per final isoform, largest first.
+    fn merge_case(seqs: &[Vec<u8>], counts: &[usize], alt: &[bool], options: &IsoformOptions)
+        -> Vec<(usize, usize)> {
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        let mut isoforms = Vec::new();
+        for ((seq, &n), &a) in seqs.iter().zip(counts).zip(alt) {
+            let first = all.len();
+            all.extend((0..n).map(|_| seq.clone()));
+            isoforms.push(Isoform { members: (first..first + n).collect(), consensus: seq.clone(), alt_start: a });
+        }
+        let reads: Vec<Read> = all.iter().enumerate()
+            .map(|(i, seq)| Read { name: i.to_string(), seq: seq.clone() }).collect();
+        let read_maps: Vec<MinimizerMap> = reads.iter()
+            .map(|r| minimizer_map(&r.seq, options.minimizer_k, options.minimizer_w)).collect();
+        merge_duplicates(isoforms, &reads, &read_maps, options)
+            .iter().map(|iso| (iso.members.len(), iso.consensus.len())).collect()
+    }
+
+    #[test]
+    fn a_smaller_isoform_at_a_validated_start_is_kept_with_alt_starts_keep() {
+        // 12 full-length reads and 4 starting at a validated start 500 bp downstream: with
+        // --alt-starts merge the smaller one merges by containment; with keep it stays.
+        let truth = random_seq(1500, 5);
+        let seqs = [truth.clone(), truth[500..].to_vec()];
+        let merge = IsoformOptions { alt_starts: AltStarts::Merge, ..IsoformOptions::default() };
+        assert_eq!(merge_case(&seqs, &[12, 4], &[false, true], &merge), vec![(16, 1500)]);
+        let keep = IsoformOptions { alt_starts: AltStarts::Keep, ..IsoformOptions::default() };
+        assert_eq!(merge_case(&seqs, &[12, 4], &[false, true], &keep), vec![(12, 1500), (4, 1000)]);
+        // a truncated copy without a validated start still merges
+        assert_eq!(merge_case(&seqs, &[12, 4], &[false, false], &keep), vec![(16, 1500)]);
+    }
+
+    #[test]
+    fn end_merge_polya_keeps_a_minor_real_3_prime_end() {
+        // A proximal end at 1500 that the distal isoform continues past with ordinary sequence.
+        let truth = random_seq(2000, 9);
+        let seqs = [truth.clone(), truth[..1500].to_vec()];
+        let ratio = IsoformOptions::default();
+        assert_eq!(merge_case(&seqs, &[10, 4], &[false, false], &ratio), vec![(14, 2000)]);
+        let polya = IsoformOptions { end_merge: EndMerge::Polya, ..IsoformOptions::default() };
+        assert_eq!(merge_case(&seqs, &[10, 4], &[false, false], &polya), vec![(10, 2000), (4, 1500)]);
+        // the same when the distal end is the minor one
+        assert_eq!(merge_case(&seqs, &[4, 10], &[false, false], &polya), vec![(10, 1500), (4, 2000)]);
+    }
+
+    #[test]
+    fn end_merge_polya_merges_an_internally_primed_end_whatever_the_read_counts() {
+        // The distal isoform is A-rich just past 1500: reads ending there are internal priming
+        // and merge even with comparable read counts, keeping the distal sequence.
+        let mut truth = random_seq(2000, 9);
+        for (i, b) in b"AAAAGAAAAAAAACAAAAAA".iter().enumerate() {
+            truth[1500 + i] = *b;
+        }
+        let seqs = [truth.clone(), truth[..1500].to_vec()];
+        let polya = IsoformOptions { end_merge: EndMerge::Polya, ..IsoformOptions::default() };
+        assert_eq!(merge_case(&seqs, &[10, 8], &[false, false], &polya), vec![(18, 2000)]);
+        assert_eq!(merge_case(&seqs, &[8, 10], &[false, false], &polya), vec![(18, 2000)]);
+        let ratio = IsoformOptions::default();
+        assert_eq!(merge_case(&seqs, &[10, 8], &[false, false], &ratio).len(), 2);
     }
 }

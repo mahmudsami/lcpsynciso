@@ -13,6 +13,28 @@ pub enum StartSplit {
     Auto,
 }
 
+/// Whether merging may fold an isoform at a validated start into the one it lies inside
+/// (`--alt-starts`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltStarts {
+    /// By containment, like any other isoform, when it has at most `collapse_ratio` of the
+    /// other's reads.
+    Merge,
+    /// Never by containment: it starts at a transcription start of its own.
+    Keep,
+}
+
+/// How merging decides between isoforms that differ only at the 3' end (`--end-merge`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndMerge {
+    /// By read counts: the shorter-ended one merges when it has at most `collapse_ratio` of
+    /// the other's reads.
+    Ratio,
+    /// By internal priming: the earlier 3' end merges, whatever the read counts, if the
+    /// longer isoform is A-rich just past it; otherwise both are real ends and stay apart.
+    Polya,
+}
+
 /// Settings for [`super::detect_isoforms`], grouped by the step that reads them.
 #[derive(Clone)]
 pub struct IsoformOptions {
@@ -60,6 +82,14 @@ pub struct IsoformOptions {
     pub collapse_ratio: f64,
     /// Consensus identity at which two isoforms merge regardless of `collapse_ratio`.
     pub collapse_ident: f64,
+    /// Whether an isoform at a validated start may merge into one it lies inside.
+    pub alt_starts: AltStarts,
+    /// How isoforms that differ only at the 3' end are merged.
+    pub end_merge: EndMerge,
+    /// With `EndMerge::Polya`: bases past the earlier 3' end that are tested for A content.
+    pub priming_window: usize,
+    /// With `EndMerge::Polya`: A fraction of that window that means internal priming.
+    pub priming_a_frac: f64,
 }
 
 impl Default for IsoformOptions {
@@ -80,6 +110,10 @@ impl Default for IsoformOptions {
             collapse_gap: 3,
             collapse_ratio: 0.5,
             collapse_ident: 0.98,
+            alt_starts: AltStarts::Keep,
+            end_merge: EndMerge::Ratio,
+            priming_window: 20,
+            priming_a_frac: 0.6,
         }
     }
 }
@@ -118,6 +152,28 @@ pub(crate) fn apply_isoform_flag(
         "--collapse-gap" => options.collapse_gap = next().parse().unwrap(),
         "--collapse-ratio" => options.collapse_ratio = next().parse().unwrap(),
         "--collapse-ident" => options.collapse_ident = next().parse().unwrap(),
+        "--alt-starts" => {
+            options.alt_starts = match next().as_str() {
+                "merge" => AltStarts::Merge,
+                "keep" => AltStarts::Keep,
+                other => {
+                    eprintln!("--alt-starts takes merge or keep, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--end-merge" => {
+            options.end_merge = match next().as_str() {
+                "ratio" => EndMerge::Ratio,
+                "polya" => EndMerge::Polya,
+                other => {
+                    eprintln!("--end-merge takes ratio or polya, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--priming-window" => options.priming_window = next().parse().unwrap(),
+        "--priming-a-frac" => options.priming_a_frac = next().parse().unwrap(),
         _ => return false,
     }
     true
@@ -159,4 +215,14 @@ MERGING (near-identical isoforms, after consensus):
     --collapse-ratio F      merge only if the smaller has <= F x the     [0.5]
                             reads of the larger
     --collapse-ident F      consensus identity at which isoforms merge   [0.98]
-                            regardless of --collapse-ratio";
+                            regardless of --collapse-ratio
+    --alt-starts keep|merge whether an isoform at a validated start may  [keep]
+                            merge into one it lies inside (keep: never;
+                            merge: by containment, like any other isoform)
+    --end-merge ratio|polya isoforms differing only at the 3' end: ratio [ratio]
+                            = merge by --collapse-ratio; polya = merge the
+                            earlier end, whatever the read counts, only if the
+                            longer isoform is A-rich just past it (internal
+                            priming), else keep both
+    --priming-window N      bases past the earlier end tested (polya)    [20]
+    --priming-a-frac F      A fraction there meaning internal priming    [0.6]";
