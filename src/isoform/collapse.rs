@@ -19,9 +19,9 @@
 //! Containment treats an indel of more than `collapse_gap` bp as a difference, as the
 //! near-identity test does.
 //!
-//! Two switches change containment (defaults keep the behaviour above):
-//!   * `--alt-starts keep`: an isoform at a validated start never merges into one it lies
-//!     inside (by default only the larger of a pair is protected);
+//! Two switches change containment:
+//!   * `--alt-starts keep` (the default): an isoform at a validated start never merges into
+//!     one it lies inside; with `merge`, only the larger of a pair is protected;
 //!   * `--end-merge polya`: a pair differing only at the 3' end is decided by internal
 //!     priming instead of read counts. HiFi FLNC reads end at a polyA tail, so an earlier 3'
 //!     end is either a real polyA site or the oligo-dT primer annealed to an A-rich stretch;
@@ -365,11 +365,11 @@ mod tests {
 
     #[test]
     fn a_smaller_isoform_at_a_validated_start_is_kept_with_alt_starts_keep() {
-        // 12 full-length reads and 4 starting at a validated start 500 bp downstream: by
-        // default the smaller one merges by containment; with --alt-starts keep it stays.
+        // 12 full-length reads and 4 starting at a validated start 500 bp downstream: with
+        // --alt-starts merge the smaller one merges by containment; with keep it stays.
         let truth = random_seq(1500, 5);
         let seqs = [truth.clone(), truth[500..].to_vec()];
-        let merge = IsoformOptions::default();
+        let merge = IsoformOptions { alt_starts: AltStarts::Merge, ..IsoformOptions::default() };
         assert_eq!(merge_case(&seqs, &[12, 4], &[false, true], &merge), vec![(16, 1500)]);
         let keep = IsoformOptions { alt_starts: AltStarts::Keep, ..IsoformOptions::default() };
         assert_eq!(merge_case(&seqs, &[12, 4], &[false, true], &keep), vec![(12, 1500), (4, 1000)]);

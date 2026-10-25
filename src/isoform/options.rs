@@ -114,7 +114,7 @@ impl Default for IsoformOptions {
             collapse_gap: 3,
             collapse_ratio: 0.5,
             collapse_ident: 0.98,
-            alt_starts: AltStarts::Merge,
+            alt_starts: AltStarts::Keep,
             end_merge: EndMerge::Ratio,
             priming_window: 20,
             priming_a_frac: 0.6,
@@ -234,8 +234,9 @@ MERGING (near-identical isoforms, after consensus):
                             reads of the larger
     --collapse-ident F      consensus identity at which isoforms merge   [0.98]
                             regardless of --collapse-ratio
-    --alt-starts merge|keep whether an isoform at a validated start may  [merge]
-                            merge into one it lies inside (keep: never)
+    --alt-starts keep|merge whether an isoform at a validated start may  [keep]
+                            merge into one it lies inside (keep: never;
+                            merge: by containment, like any other isoform)
     --end-merge ratio|polya isoforms differing only at the 3' end: ratio [ratio]
                             = merge by --collapse-ratio; polya = merge the
                             earlier end, whatever the read counts, only if the
