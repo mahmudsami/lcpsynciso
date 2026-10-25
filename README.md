@@ -105,6 +105,11 @@ order needs it, because the longest reads start clusters first.
 4. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
    the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
    past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
+   An isoform at a validated start is never merged into the isoform it lies inside
+   (`--alt-starts keep`, the default; `merge` lets it merge like any other). Isoforms that
+   differ only at the 3' end merge when the smaller has at most `--collapse-ratio` of the
+   larger's reads; with `--end-merge polya` they merge instead only if the longer isoform
+   is A-rich just past the earlier end (internal priming), whatever the read counts.
 
 ## Notes
 
