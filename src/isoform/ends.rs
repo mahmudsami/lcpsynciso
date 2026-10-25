@@ -171,7 +171,10 @@ fn find_validated_starts(
             .into_iter()
             .filter(|&peak| peak > START_RADIUS)
             .collect();
-    if candidates.is_empty() {
+    // With --dump-starts every group is labelled, so the dump covers groups without a
+    // candidate too; the validated starts are the same.
+    let dump = stats::start_dump_on();
+    if candidates.is_empty() && !dump {
         return candidates;
     }
     let backbone_seq = &reads[backbone_idx].seq;
@@ -179,7 +182,11 @@ fn find_validated_starts(
         .iter()
         .map(|&(read_idx, start, _)| {
             if start > START_RADIUS {
-                has_untemplated_g(&reads[read_idx].seq, backbone_seq, start as usize)
+                let lead = untemplated_lead(&reads[read_idx].seq, backbone_seq, start as usize);
+                if let (true, Some((n, first))) = (dump, lead) {
+                    stats::record_lead(n, first);
+                }
+                lead.map(|(n, first)| n > 0 && first == b'G')
             } else {
                 None
             }
@@ -192,6 +199,9 @@ fn find_validated_starts(
     };
     let (known, with_g) = tally(&mut (0..group.len()));
     let cap_signal = known >= MIN_CAP_READS && with_g as f64 >= CAP_LIBRARY * known as f64;
+    if dump {
+        stats::start_dump(format!("group\t{}\t{known}\t{with_g}\t{}", group.len(), cap_signal as u8));
+    }
 
     let mut validated = Vec::new();
     for peak in candidates {
@@ -201,16 +211,24 @@ fn find_validated_starts(
         if peak_reads.len() < options.min_iso {
             continue;
         }
+        let (n, g) = tally(&mut peak_reads.iter().copied());
+        let near = group
+            .iter()
+            .filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW)
+            .count();
         let real = if cap_signal {
-            let (n, g) = tally(&mut peak_reads.iter().copied());
             n >= options.min_iso && g as f64 >= MIN_CAPPED * n as f64
         } else {
-            let near = group
-                .iter()
-                .filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW)
-                .count();
             peak_reads.len() as f64 >= MIN_SHARPNESS * near as f64
         };
+        if dump {
+            stats::start_dump(format!(
+                "cand\t{peak}\t{}\t{n}\t{g}\t{near}\t{}\t{}",
+                peak_reads.len(),
+                real as u8,
+                cap_signal as u8
+            ));
+        }
         if real {
             validated.push(peak);
         }
@@ -218,12 +236,13 @@ fn find_validated_starts(
     validated
 }
 
-/// Whether `read_seq`, whose first matched base sits at backbone position `start`, begins
-/// with an untemplated G: 1-3 leading bases, the first a G, that the backbone doesn't have
-/// there. None if the read's start doesn't match the backbone exactly nearby (sequencing
-/// errors), so the read tells nothing. A G that the transcript itself has just before the
-/// start is indistinguishable and counts as templated.
-fn has_untemplated_g(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Option<bool> {
+/// How `read_seq`, whose first matched base sits at backbone position `start`, begins: the
+/// number of leading bases (0-3) before it matches the backbone exactly for 12 bases there
+/// (within 1 bp), and its first base. An untemplated G is 1-3 leading bases, the first a G,
+/// that the backbone doesn't have there. None if the read's start doesn't match the backbone
+/// exactly nearby (sequencing errors), so the read tells nothing. A G that the transcript
+/// itself has just before the start is indistinguishable and counts as templated.
+fn untemplated_lead(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Option<(usize, u8)> {
     const L: usize = 12;
     for lead in 0..=3usize {
         for b in [start, start.saturating_sub(1), start + 1] {
@@ -231,7 +250,7 @@ fn has_untemplated_g(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Opti
                 && lead + L <= read_seq.len()
                 && read_seq[lead..lead + L] == backbone_seq[b..b + L]
             {
-                return Some(lead > 0 && read_seq[0] == b'G');
+                return Some((lead, read_seq[0]));
             }
         }
     }

@@ -52,6 +52,8 @@ pub struct Config {
     pub max_cluster_size: usize,
     // Write each read's phase B cluster to `gene_clusters.tsv`.
     pub dump_clusters: bool,
+    // Write what start validation sees to this file (`--dump-starts`; diagnostics only).
+    pub dump_starts: Option<String>,
     // Isoform detection.
     pub isoform_options: IsoformOptions,
 }
@@ -77,6 +79,7 @@ impl Default for Config {
             min_cluster_size: 1,
             max_cluster_size: usize::MAX,
             dump_clusters: false,
+            dump_starts: None,
             isoform_options: IsoformOptions::default(),
         }
     }
@@ -117,6 +120,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--iso-k" => config.isoform_options.minimizer_k = next().parse().unwrap(),
             "--iso-w" => config.isoform_options.minimizer_w = next().parse().unwrap(),
             "--dump-clusters" => config.dump_clusters = true,
+            "--dump-starts" => config.dump_starts = Some(next()),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -157,6 +161,8 @@ GENERAL:
     --batch N               reads per batch                              [500000]
     --max-reads N           stop after N reads                           [all]
     --dump-clusters         also write gene_clusters.tsv (phase B clusters)
+    --dump-starts FILE      write what start validation sees (start peaks, labelled
+                            and capped reads per structure group) to FILE
 
 CLUSTERING (seeds):
     --k N / --s N           k-mer / s-mer length                         [15 / 9]
@@ -249,6 +255,9 @@ pub fn run(config: Config) {
     }
 
     // ── Phase C: detect isoforms ──
+    if let Some(path) = &config.dump_starts {
+        isoform::stats::open_start_dump(path);
+    }
     let phase_c_start = Instant::now();
     let mut eligible_clusters: Vec<u32> = (0..n_clusters as u32)
         .filter(|&c| {
@@ -286,6 +295,7 @@ pub fn run(config: Config) {
         }
     });
     let (total_isoforms, n_processed_clusters) = writer.into_inner().unwrap().finish();
+    isoform::stats::close_start_dump();
     let phase_c_time = phase_c_start.elapsed();
 
     // ── Report ──
