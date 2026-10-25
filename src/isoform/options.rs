@@ -86,8 +86,9 @@ pub struct IsoformOptions {
     pub alt_starts: AltStarts,
     /// How isoforms that differ only at the 3' end are merged.
     pub end_merge: EndMerge,
-    /// With `AltStarts::Keep`: a validated start this close (bp) to the other isoform's start
-    /// is the same transcription start site (a broad promoter), so the pair merges as usual.
+    /// With `AltStarts::Keep`: a smaller isoform's validated start this close (bp) to the
+    /// larger isoform's start is the same transcription start site (a broad promoter), so the
+    /// pair merges as usual.
     pub alt_start_min_dist: u32,
     /// With `EndMerge::Polya`: 3' ends this close (bp) are the same polyA site (cleavage
     /// varies by a few bp), so the pair merges whatever the A content.
@@ -228,8 +229,9 @@ MERGING (near-identical isoforms, after consensus):
                             regardless of --collapse-ratio
     --alt-starts merge|keep whether an isoform at a validated start may  [merge]
                             merge into one it lies inside (keep: never)
-    --alt-start-min-dist N  keep: a validated start within N bp of the  [50]
-                            other's start is the same TSS and merges as usual
+    --alt-start-min-dist N  keep: a smaller isoform's validated start   [50]
+                            within N bp of the larger's start is the same TSS
+                            and merges as usual
     --end-merge ratio|polya isoforms differing only at the 3' end: ratio [ratio]
                             = merge by --collapse-ratio; polya = merge the
                             earlier end, whatever the read counts, only if the
