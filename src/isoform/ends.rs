@@ -31,10 +31,6 @@ const NO_START: i32 = i32::MIN;
 /// A read starting within this many bp of a validated start starts there. Real starts spread
 /// over ~20-50 bp, and this was the best peak window in calibration.
 const START_RADIUS: i32 = 25;
-/// With `site_peaks`, a 3' end peak claims every read end within this many bp, so one polyA
-/// site gives one peak. PolyASite 2.0 groups cleavage sites within 12 nt of a better-supported
-/// one into the same site, the distance up to which the number of clusters falls sharply.
-const END_SITE_RADIUS: i32 = 12;
 /// Sharpness compares the starts within `START_RADIUS` with those within this many bp.
 const SHARP_WINDOW: i32 = 300;
 /// Without a cap signal, a peak this sharp is a real start. SIRV: truncation peaks mostly
@@ -60,11 +56,8 @@ pub(super) fn split_by_ends(
     let tol = options.boundary_tol.max(1) as i32;
 
     let width = options.peak_width.max(1) as i32;
-    let start_peaks =
-        find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso, 0);
-    let end_radius = if options.site_peaks { END_SITE_RADIUS } else { 0 };
-    let end_peaks =
-        find_peaks(group.iter().map(|&(_, _, end)| end), width, options.min_iso, end_radius);
+    let start_peaks = find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso);
+    let end_peaks = find_peaks(group.iter().map(|&(_, _, end)| end), width, options.min_iso);
     let mut start_key: Vec<Option<i32>> =
         group.iter().map(|&(_, start, _)| nearest_peak(&start_peaks, start, tol)).collect();
     let end_key: Vec<Option<i32>> =
@@ -173,11 +166,8 @@ fn find_validated_starts(
     options: &IsoformOptions,
 ) -> Vec<i32> {
     let width = options.peak_width.max(1) as i32;
-    // A candidate counts the reads within `START_RADIUS`, so with `site_peaks` no other
-    // candidate may form inside that radius and count the same reads.
-    let radius = if options.site_peaks { START_RADIUS } else { 0 };
     let candidates: Vec<i32> =
-        find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso, radius)
+        find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso)
             .into_iter()
             .filter(|&peak| peak > START_RADIUS)
             .collect();
@@ -251,16 +241,7 @@ fn has_untemplated_g(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Opti
 /// Peaks in a set of coordinates, ascending: repeatedly take the `width`-wide window holding
 /// the most remaining points, record its median, and remove those points. Stops once the
 /// densest window has fewer than `min_support` points, since what remains is a smear.
-///
-/// With `radius > 0` a peak removes every point within `radius` of it, not only its window's:
-/// a site whose points spread over more than `width` would otherwise leave enough beside the
-/// window for a second peak about `width` away.
-fn find_peaks(
-    xs: impl Iterator<Item = i32>,
-    width: i32,
-    min_support: usize,
-    radius: i32,
-) -> Vec<i32> {
+fn find_peaks(xs: impl Iterator<Item = i32>, width: i32, min_support: usize) -> Vec<i32> {
     let mut pts: Vec<i32> = xs.collect();
     pts.sort_unstable();
 
@@ -285,15 +266,8 @@ fn find_peaks(
         if best < min_support {
             break;
         }
-        let peak = pts[(lo + hi) / 2];
-        peaks.push(peak);
-        if radius > 0 {
-            let from = pts.partition_point(|&p| p < peak - radius);
-            let to = pts.partition_point(|&p| p <= peak + radius);
-            pts.drain(from..to);
-        } else {
-            pts.drain(lo..=hi);
-        }
+        peaks.push(pts[(lo + hi) / 2]);
+        pts.drain(lo..=hi);
     }
     peaks.sort_unstable();
     peaks
@@ -413,17 +387,6 @@ mod tests {
     fn without_start_split_full_length_reads_join_their_isoform() {
         let options = IsoformOptions { start_split: StartSplit::Off, ..IsoformOptions::default() };
         assert_eq!(sizes(&truncated_majority(), &options), vec![11]);
-    }
-
-    #[test]
-    fn site_peaks_give_one_peak_per_site() {
-        // One site whose ends spread over 14 bp: the window leaves 4 beside it, a second peak.
-        let spread = [100, 101, 102, 103, 104, 105, 106, 107, 108, 110, 111, 112, 113, 114];
-        assert_eq!(find_peaks(spread.into_iter(), 10, 3, 0).len(), 2);
-        assert_eq!(find_peaks(spread.into_iter(), 10, 3, END_SITE_RADIUS).len(), 1);
-        // two sites 20 bp apart stay two
-        let two = [100, 101, 102, 103, 120, 121, 122, 123];
-        assert_eq!(find_peaks(two.into_iter(), 10, 3, END_SITE_RADIUS), vec![101, 121]);
     }
 
     #[test]

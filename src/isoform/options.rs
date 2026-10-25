@@ -69,9 +69,6 @@ pub struct IsoformOptions {
     /// How far (bp) a read end may sit from its peak, and the slack when folding a partial
     /// read into an isoform.
     pub boundary_tol: u32,
-    /// Whether a peak claims every read end within its site radius, so one start or polyA
-    /// site gives one peak (`--site-peaks`; see `ends.rs`).
-    pub site_peaks: bool,
 
     // Step 3: isoforms.
     /// Minimum reads for an isoform, and for an end peak.
@@ -109,7 +106,6 @@ impl Default for IsoformOptions {
             start_split: StartSplit::Auto,
             peak_width: 10,
             boundary_tol: 150,
-            site_peaks: false,
             min_iso: 3,
             collapse_gap: 3,
             collapse_ratio: 0.5,
@@ -152,16 +148,6 @@ pub(crate) fn apply_isoform_flag(
         "--no-split-starts" => options.start_split = StartSplit::Off,
         "--peak-width" => options.peak_width = next().parse().unwrap(),
         "--boundary-tol" => options.boundary_tol = next().parse().unwrap(),
-        "--site-peaks" => {
-            options.site_peaks = match next().as_str() {
-                "off" => false,
-                "on" => true,
-                other => {
-                    eprintln!("--site-peaks takes off or on, not {other}");
-                    std::process::exit(2);
-                }
-            }
-        }
         "--min-iso" => options.min_iso = next().parse().unwrap(),
         "--collapse-gap" => options.collapse_gap = next().parse().unwrap(),
         "--collapse-ratio" => options.collapse_ratio = next().parse().unwrap(),
@@ -223,10 +209,6 @@ READ ENDS (a structure group splits into isoforms by where its reads start and e
                             can sit ~20 bp apart
     --boundary-tol N        max bp between a read end and its peak, and  [150]
                             the slack when folding partial reads into an isoform
-    --site-peaks off|on     on: a peak claims every read end within its  [off]
-                            site (12 bp for 3' ends, as PolyASite; 25 bp
-                            for starts), so a site whose reads spread over
-                            more than the window still gives one peak
 
 MERGING (near-identical isoforms, after consensus):
     --collapse-gap N        max gap or length difference (bp) to merge   [3]
