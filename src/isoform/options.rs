@@ -288,8 +288,9 @@ MERGING (near-identical isoforms, after consensus):
     --collapse-ident F      consensus identity at which isoforms merge   [0.98]
                             regardless of --collapse-ratio
     --alt-starts keep|merge whether an isoform at a validated start may  [keep]
-                            merge into one it lies inside (keep: never;
-                            merge: by containment, like any other isoform)
+                            merge into one it lies inside (keep: not if
+                            their starts differ, by > 50 bp from a start that
+                            isn't validated; merge: by containment)
     --end-merge ratio|polya isoforms differing only at the 3' end: ratio [ratio]
                             = merge by --collapse-ratio; polya = merge the
                             earlier end, whatever the read counts, only if the

@@ -19,9 +19,15 @@
 //! Containment treats an indel of more than `collapse_gap` bp as a difference, as the
 //! near-identity test does.
 //!
+//! An isoform at a validated start is a transcript of its own, so a pair whose starts differ
+//! stays apart when either is one. Two validated starts differ beyond `collapse_gap`; a
+//! validated start and one that isn't (its backbone's start, the upstream edge of its start
+//! site) differ only beyond a site width (`SITE_WIDTH`).
+//!
 //! Two switches change containment:
 //!   * `--alt-starts keep` (the default): an isoform at a validated start never merges into
-//!     one it lies inside; with `merge`, only the larger of a pair is protected;
+//!     one it lies inside with a different start; with `merge`, only the larger of a pair is
+//!     protected;
 //!   * `--end-merge polya`: a pair differing only at the 3' end is decided by internal
 //!     priming instead of read counts. HiFi FLNC reads end at a polyA tail, so an earlier 3'
 //!     end is either a real polyA site or the oligo-dT primer annealed to an A-rich stretch;
@@ -32,6 +38,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::anchors::{minimizer_map, MinimizerMap};
+use super::ends::SITE_WIDTH;
 use super::fit::{place_on_backbone, strip_homopolymer_ends};
 use super::{align, consensus, AltStarts, EndMerge, Isoform, IsoformOptions, Read};
 
@@ -144,10 +151,16 @@ fn decide_merge(
     }
     // Containment, testing the shorter consensus against the longer. An end reaching more
     // than `collapse_gap` bp past the other's is a real extension, not a consensus wobble.
-    // An isoform at a validated downstream start is a transcript of its own, so a pair that
-    // differs at the 5' end stays apart when either is one.
+    // An isoform at a validated downstream start is a transcript of its own, so a pair whose
+    // starts differ stays apart when either is one: two validated starts beyond
+    // `collapse_gap`, a validated start and its backbone's start beyond `SITE_WIDTH`.
     let end_slack = options.collapse_gap as i32;
-    let either_alt_start = small.alt_start || big.alt_start;
+    let start_slack = match (small.alt_start, big.alt_start) {
+        (false, false) => None,
+        (true, true) => Some(end_slack),
+        _ => Some(SITE_WIDTH),
+    };
+    let starts_differ = |start: i32| start_slack.is_some_and(|slack| start.abs() > slack);
     if small.consensus.len() <= big.consensus.len() {
         // `small` placed on `big`; it may overhang `big`'s 5' end (a negative start).
         match place_on_backbone(small_map, big_map, &small.consensus, &big.consensus, strict) {
@@ -157,7 +170,7 @@ fn decide_merge(
                 // Same 3' end: `small` is `big` with its 5' end intact. Otherwise the two
                 // differ at both ends and stay apart.
                 if within_ratio
-                    && !either_alt_start
+                    && !starts_differ(start)
                     && end >= big.consensus.len() as i32 - options.boundary_tol as i32
                 {
                     MergeDecision::MergeAndRebuild
@@ -166,7 +179,7 @@ fn decide_merge(
                 }
             }
             Some((start, _))
-                if options.alt_starts == AltStarts::Keep && small.alt_start && start > end_slack =>
+                if options.alt_starts == AltStarts::Keep && small.alt_start && starts_differ(start) =>
             {
                 MergeDecision::KeepSeparate
             }
@@ -185,9 +198,7 @@ fn decide_merge(
         // `big` placed on `small`: `small` extends it at the 5' end, the 3' end, or both.
         match place_on_backbone(big_map, small_map, &big.consensus, &small.consensus, strict) {
             None => MergeDecision::KeepSeparate,
-            Some((start, _)) if start > end_slack && either_alt_start => {
-                MergeDecision::KeepSeparate
-            }
+            Some((start, _)) if starts_differ(start) => MergeDecision::KeepSeparate,
             Some((_, end)) if polya && end < small.consensus.len() as i32 - end_slack => {
                 // `big` ends early: internal priming if `small` is A-rich just past its end.
                 if internally_primed(&small.consensus, end, options) {
@@ -375,6 +386,21 @@ mod tests {
         assert_eq!(merge_case(&seqs, &[12, 4], &[false, true], &keep), vec![(12, 1500), (4, 1000)]);
         // a truncated copy without a validated start still merges
         assert_eq!(merge_case(&seqs, &[12, 4], &[false, false], &keep), vec![(16, 1500)]);
+    }
+
+    #[test]
+    fn a_validated_start_within_a_site_width_of_one_that_is_not_validated_is_the_same_start() {
+        // A full-length isoform and one at a validated start `d` bp downstream: within a site
+        // width they are one start and merge; further apart, or both validated, they stay.
+        let truth = random_seq(1500, 5);
+        let at = |d: usize| [truth.clone(), truth[d..].to_vec()];
+        let keep = IsoformOptions::default();
+        assert_eq!(merge_case(&at(40), &[12, 4], &[false, true], &keep), vec![(16, 1500)]);
+        assert_eq!(merge_case(&at(80), &[12, 4], &[false, true], &keep).len(), 2);
+        assert_eq!(merge_case(&at(40), &[12, 4], &[true, true], &keep).len(), 2);
+        // the full-length one the smaller: it extends the validated one, which is rebuilt
+        let longer_minor = [truth[40..].to_vec(), truth.clone()];
+        assert_eq!(merge_case(&longer_minor, &[12, 4], &[true, false], &keep), vec![(16, 1500)]);
     }
 
     #[test]

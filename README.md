@@ -93,7 +93,8 @@ order needs it, because the longest reads start clusters first.
    peaks mostly mark truncation, and splitting by every one (`on`) makes the truncated
    majority an isoform of its own and drops the few full-length reads. With `off` only 3'
    end peaks split, and a read reaching further 5' than an isoform joins it. `auto` (the
-   default) is `off` plus: a downstream start peak that looks like a real transcription
+   default) is `off` plus: a start peak more than 50 bp downstream (a start site's width,
+   since the longest read's start is the edge of its site) that looks like a real transcription
    start keeps its reads as an isoform of its own, beside the full-length one. In capped cDNA (template
    switching) that means most of its reads carry an untemplated 5' G; without that signal
    (direct RNA, spike-ins), a sharp peak. `predict` decides both from the whole library
@@ -108,8 +109,9 @@ order needs it, because the longest reads start clusters first.
 4. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
    the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
    past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
-   An isoform at a validated start is never merged into the isoform it lies inside
-   (`--alt-starts keep`, the default; `merge` lets it merge like any other). Isoforms that
+   An isoform at a validated start stays apart from one whose start differs: by more than
+   3 bp from another validated start, by more than 50 bp from a start that isn't validated
+   (`--alt-starts keep`, the default; `merge` lets it merge into one it lies inside). Isoforms that
    differ only at the 3' end merge when the smaller has at most `--collapse-ratio` of the
    larger's reads; with `--end-merge polya` they merge instead only if the longer isoform
    is A-rich just past the earlier end (internal priming), whatever the read counts.

@@ -31,6 +31,13 @@ const NO_START: i32 = i32::MIN;
 /// A read starting within this many bp of a validated start starts there. Real starts spread
 /// over ~20-50 bp, and this was the best peak window in calibration.
 const START_RADIUS: i32 = 25;
+/// A validated start is the centre of its start site (a pile's median), so `START_RADIUS`
+/// around it is the site. A start that isn't validated is its backbone's start, the most
+/// upstream read of its site: the site's edge, which reaches up to the full site width
+/// downstream (refTSS: 94% of regions are at most 50 bp wide). A start candidate must lie
+/// further than this into the backbone, and merging keeps such a start and a validated one
+/// apart only if they differ by more than this.
+pub(super) const SITE_WIDTH: i32 = 2 * START_RADIUS;
 /// Sharpness compares the starts within `START_RADIUS` with those within this many bp.
 const SHARP_WINDOW: i32 = 300;
 /// Without a cap signal and without a threshold from the library (`find-isoforms`, or too few
@@ -159,8 +166,9 @@ pub(super) fn split_by_ends(
 }
 
 /// Start peaks inside the backbone that look like real transcription starts rather than 5'
-/// truncation, ascending. The backbone reaches further 5', so each is a candidate alternative
-/// start of a longer transcript. A candidate needs `min_iso` reads within `START_RADIUS`, and
+/// truncation, ascending. The backbone reaches further 5', so each peak more than
+/// `SITE_WIDTH` into it is a candidate alternative start of a longer transcript. A candidate
+/// needs `min_iso` reads within `START_RADIUS`, and
 ///   * if the library shows a cap signal (template switching adds an untemplated G at a capped
 ///     5' end), the library's share of them carrying an untemplated G (`StartLibrary`);
 ///   * otherwise (direct RNA, uncapped spike-ins), a sharp peak: `MIN_SHARPNESS` of the starts
@@ -176,7 +184,7 @@ fn find_validated_starts(
     let candidates: Vec<i32> =
         find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso)
             .into_iter()
-            .filter(|&peak| peak > START_RADIUS)
+            .filter(|&peak| peak > SITE_WIDTH)
             .collect();
     // With --dump-starts every group is labelled, so the dump covers groups without a
     // candidate too; the validated starts are the same.
@@ -392,7 +400,7 @@ pub(super) fn add_start_stats(
     acc.labelled += capped.iter().flatten().count() as u64;
     acc.capped += capped.iter().flatten().filter(|&&c| c).count() as u64;
     let peaks = find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso);
-    for peak in peaks.into_iter().filter(|&peak| peak > START_RADIUS) {
+    for peak in peaks.into_iter().filter(|&peak| peak > SITE_WIDTH) {
         let near: Vec<usize> = (0..group.len())
             .filter(|&group_pos| (group[group_pos].1 - peak).abs() <= START_RADIUS)
             .collect();
@@ -586,6 +594,22 @@ mod tests {
     fn auto_without_a_cap_signal_keeps_a_sharp_peak_and_folds_a_smeared_one() {
         assert!(alt_start_group(false, false, false).iter().any(|i| i.1));
         assert!(alt_start_group(false, false, true).iter().all(|i| !i.1));
+    }
+
+    #[test]
+    fn a_start_pile_within_a_site_width_of_the_backbone_start_is_no_candidate() {
+        // Three reads at the backbone's start and six starting together `p` bp downstream
+        // (validated as a sharp peak): a start of its own only beyond a site width.
+        let alt_starts = |p: i32| {
+            let mut group: Vec<PlacedRead> = (0..3).map(|i| (i, 0, 2000)).collect();
+            group.extend((3..9).map(|i| (i, p, 2000)));
+            let reads: Vec<Read> =
+                (0..9).map(|i| Read { name: i.to_string(), seq: Vec::new() }).collect();
+            let options = IsoformOptions { start_split: StartSplit::Auto, ..IsoformOptions::default() };
+            split_by_ends(&group, &reads, 0, &options).iter().filter(|i| i.1).count()
+        };
+        assert_eq!(alt_starts(40), 0);
+        assert_eq!(alt_starts(60), 1);
     }
 
     /// Three full-length reads whose starts smear over ~100 bp, and eight 5'-truncated reads
