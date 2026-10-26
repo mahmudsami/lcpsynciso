@@ -157,6 +157,8 @@ pub(crate) fn print_report() {
 //   cand   peak  reads_25bp  labelled  capped  reads_300bp  validated  cap_signal  backbone
 //          reads per window (bp:count, ...)  reads_upstream  reads_downstream (26-300 bp)
 //          reads_through (start upstream of the pile, end past it)  backbone_length
+//   end    peak  reads_ending_25bp  reads_through  A_in_next_20bp  to_backbone_end  backbone
+//          backbone_length  group_reads           (every end peak; A count -1 at the end)
 //   library  labelled  capped  cap_signal  threshold  candidates  sharpness   (predict)
 //   lead   n_leading_bases  first_base  reads        (summary, written by `close_start_dump`)
 

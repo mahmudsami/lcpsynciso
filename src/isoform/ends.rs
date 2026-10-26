@@ -65,6 +65,9 @@ pub(super) fn split_by_ends(
     let width = options.peak_width.max(1) as i32;
     let start_peaks = find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso);
     let end_peaks = find_peaks(group.iter().map(|&(_, _, end)| end), width, options.min_iso);
+    if stats::start_dump_on() {
+        dump_end_peaks(group, reads, backbone_idx, &end_peaks);
+    }
     let mut start_key: Vec<Option<i32>> =
         group.iter().map(|&(_, start, _)| nearest_peak(&start_peaks, start, tol)).collect();
     let end_key: Vec<Option<i32>> =
@@ -156,6 +159,37 @@ pub(super) fn split_by_ends(
         .into_iter()
         .map(|(key, isoform)| (isoform, auto && key.0 != NO_START))
         .collect()
+}
+
+/// --dump-starts: what a 3' end validation would see at each end peak of `group`, which sits on
+/// `reads[backbone_idx]`: the reads ending within `START_RADIUS` of it, the reads running past it
+/// (starting upstream of the peak's window and ending downstream of it), and the A count in the
+/// backbone's 20 bases after it (-1 if fewer remain). An end inside the transcript where the
+/// backbone is A-rich next is the mark of internal priming: the oligo-dT primer annealed to an
+/// A-rich stretch of the RNA rather than to its poly(A) tail.
+fn dump_end_peaks(group: &[PlacedRead], reads: &[Read], backbone_idx: usize, end_peaks: &[i32]) {
+    let backbone = &reads[backbone_idx].seq;
+    let length = backbone.len() as i32;
+    for &peak in end_peaks {
+        let ending =
+            group.iter().filter(|&&(_, _, end)| (end - peak).abs() <= START_RADIUS).count();
+        let through = group
+            .iter()
+            .filter(|&&(_, start, end)| start < peak - START_RADIUS && end > peak + START_RADIUS)
+            .count();
+        let a20 = if peak >= 0 && peak + 20 <= length {
+            let next = &backbone[peak as usize..peak as usize + 20];
+            next.iter().filter(|&&b| b == b'A' || b == b'a').count() as i32
+        } else {
+            -1
+        };
+        stats::start_dump(format!(
+            "end\t{peak}\t{ending}\t{through}\t{a20}\t{}\t{}\t{length}\t{}",
+            length - peak,
+            reads[backbone_idx].name,
+            group.len()
+        ));
+    }
 }
 
 /// Start peaks inside the backbone that look like real transcription starts rather than 5'
