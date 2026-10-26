@@ -269,13 +269,14 @@ fn find_validated_starts(
 
 /// What start validation sees across a library: its labelled reads (start more than
 /// `START_RADIUS` into the backbone, with an exact match there), how many of them carry an
-/// untemplated G, the capped share of every start candidate with `min_iso` labelled reads, and
-/// the sharpness of every start candidate.
+/// untemplated G, the capped share and sharpness of every start candidate with `min_iso`
+/// labelled reads, and the sharpness of every start candidate.
 #[derive(Default)]
 pub(crate) struct StartStats {
     pub labelled: u64,
     pub capped: u64,
-    pub candidates: Vec<f32>,
+    /// (capped share, sharpness) of the candidates with `min_iso` labelled reads.
+    pub candidates: Vec<(f32, f32)>,
     pub sharpness: Vec<f32>,
 }
 
@@ -288,27 +289,34 @@ impl StartStats {
     }
 
     /// The library's cap signal and thresholds, unless set on the command line. The cap signal
-    /// is on when at least `CAP_LIBRARY` of the labelled reads are capped. The cap threshold is
+    /// is on when at least `CAP_LIBRARY` of the labelled reads are capped, and, with at least
+    /// `MIN_LIBRARY_CANDIDATES` labelled candidates, the candidates above the cap threshold are
+    /// sharper than those below it (one-sided Mann-Whitney, p < 0.001): a cap marks real
+    /// starts, which form tight piles. In ONT PCR-cDNA, untemplated-looking Gs left by primer
+    /// trimming pass the share but not this test. The cap threshold is
     /// the cut between the two modes of the candidates' capped shares, truncation peaks near
     /// none and real starts near all (Otsu); the sharpness threshold is the Otsu cut over the
     /// candidates' sharpness, diffuse truncation against tight starts. With fewer than
     /// `MIN_LIBRARY_CANDIDATES` candidates, `MIN_CAPPED` and `MIN_SHARPNESS`.
     pub(crate) fn library(&self, options: &IsoformOptions) -> StartLibrary {
+        let threshold = options.cap_threshold.unwrap_or_else(|| {
+            if self.candidates.len() >= MIN_LIBRARY_CANDIDATES {
+                let shares: Vec<f32> = self.candidates.iter().map(|&(share, _)| share).collect();
+                otsu_threshold(&shares)
+            } else {
+                MIN_CAPPED
+            }
+        });
         let cap_signal = match options.cap_signal {
             CapSignal::On => true,
             CapSignal::Off => false,
             CapSignal::Auto => {
                 self.labelled >= MIN_CAP_READS as u64
                     && self.capped as f64 >= CAP_LIBRARY * self.labelled as f64
+                    && (self.candidates.len() < MIN_LIBRARY_CANDIDATES
+                        || self.capped_starts_are_sharper(threshold))
             }
         };
-        let threshold = options.cap_threshold.unwrap_or_else(|| {
-            if self.candidates.len() >= MIN_LIBRARY_CANDIDATES {
-                otsu_threshold(&self.candidates)
-            } else {
-                MIN_CAPPED
-            }
-        });
         let sharpness = options.sharp_threshold.unwrap_or_else(|| {
             if self.sharpness.len() >= MIN_LIBRARY_CANDIDATES {
                 otsu_threshold(&self.sharpness)
@@ -317,6 +325,48 @@ impl StartStats {
             }
         });
         StartLibrary { cap_signal, threshold, sharpness }
+    }
+
+    /// Whether the candidates with at least `threshold` capped reads are sharper than the
+    /// others: one-sided Mann-Whitney U test, normal approximation, z > 3.09 (p < 0.001).
+    pub(crate) fn capped_starts_are_sharper(&self, threshold: f64) -> bool {
+        let (z, _) = self.cap_sharpness_test(threshold);
+        z > 3.09
+    }
+
+    /// The Mann-Whitney z and AUC of sharpness, capped candidates against uncapped ones.
+    pub(crate) fn cap_sharpness_test(&self, threshold: f64) -> (f64, f64) {
+        let mut ranked: Vec<(f32, bool)> = self
+            .candidates
+            .iter()
+            .map(|&(share, sharp)| (sharp, share as f64 >= threshold))
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (n1, n2) = ranked.iter().fold((0f64, 0f64), |(a, b), &(_, c)| {
+            if c {
+                (a + 1.0, b)
+            } else {
+                (a, b + 1.0)
+            }
+        });
+        if n1 == 0.0 || n2 == 0.0 {
+            return (0.0, 0.5);
+        }
+        // Sum of the capped candidates' ranks, ties sharing their mean rank.
+        let mut rank_sum = 0f64;
+        let mut i = 0;
+        while i < ranked.len() {
+            let mut j = i;
+            while j < ranked.len() && ranked[j].0 == ranked[i].0 {
+                j += 1;
+            }
+            let mean_rank = (i + 1 + j) as f64 / 2.0;
+            rank_sum += mean_rank * ranked[i..j].iter().filter(|&&(_, c)| c).count() as f64;
+            i = j;
+        }
+        let u = rank_sum - n1 * (n1 + 1.0) / 2.0;
+        let z = (u - n1 * n2 / 2.0) / (n1 * n2 * (n1 + n2 + 1.0) / 12.0).sqrt();
+        (z, u / (n1 * n2))
     }
 }
 
@@ -350,12 +400,13 @@ pub(super) fn add_start_stats(
             .iter()
             .filter_map(|&group_pos| capped[group_pos])
             .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize));
-        if n >= options.min_iso {
-            acc.candidates.push(g as f32 / n as f32);
-        }
         let around =
             group.iter().filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW).count();
-        acc.sharpness.push(near.len() as f32 / around as f32);
+        let sharpness = near.len() as f32 / around as f32;
+        if n >= options.min_iso {
+            acc.candidates.push((g as f32 / n as f32, sharpness));
+        }
+        acc.sharpness.push(sharpness);
     }
 }
 
@@ -571,14 +622,17 @@ mod tests {
 
     #[test]
     fn the_library_decides_the_cap_signal_and_threshold() {
-        let stats = StartStats {
-            labelled: 1000,
-            capped: 400,
-            candidates: vec![0.05; 200],
-            sharpness: Vec::new(),
-        };
+        // capped candidates (share 0.9) are sharp, uncapped ones (0.05) diffuse
+        let mut candidates: Vec<(f32, f32)> = (0..150).map(|i| (0.05, (i % 30) as f32 / 100.0)).collect();
+        candidates.extend((0..50).map(|i| (0.9, 0.5 + (i % 40) as f32 / 100.0)));
+        let stats = StartStats { labelled: 1000, capped: 400, candidates, sharpness: Vec::new() };
         let auto = IsoformOptions::default();
         assert!(stats.library(&auto).cap_signal);
+        // the same Gs on candidates no sharper than the rest: not a cap signal (ONT PCR-cDNA)
+        let mut mixed: Vec<(f32, f32)> = (0..150).map(|i| (0.05, (i % 50) as f32 / 100.0)).collect();
+        mixed.extend((0..50).map(|i| (0.9, (i % 50) as f32 / 100.0)));
+        let primer = StartStats { labelled: 1000, capped: 400, candidates: mixed, sharpness: Vec::new() };
+        assert!(!primer.library(&auto).cap_signal);
         let few = StartStats { labelled: 1000, capped: 100, ..StartStats::default() };
         assert!(!few.library(&auto).cap_signal);
         assert_eq!(few.library(&auto).threshold, MIN_CAPPED);

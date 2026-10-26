@@ -299,6 +299,13 @@ pub fn run(config: Config) {
                 groups_by_position.push(groups);
             }
             let library = library_stats.library(&options);
+            if library_stats.candidates.len() >= 100 {
+                let (z, auc) = library_stats.cap_sharpness_test(library.threshold);
+                eprintln!(
+                    "[predict] start validation: capped start candidates against the others, \
+                     sharpness AUC {auc:.3} (Mann-Whitney z {z:.1})"
+                );
+            }
             let rule = if library.cap_signal {
                 format!(
                     "on: a start needs {:.0}% of its labelled reads capped ({} start candidates)",
