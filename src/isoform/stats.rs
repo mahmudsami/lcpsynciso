@@ -155,8 +155,8 @@ pub(crate) fn print_report() {
 // Off unless `open_start_dump` was called; the isoforms are the same either way. Lines:
 //   group  n_reads  labelled  capped  cap_signal
 //   cand   peak  reads_25bp  labelled  capped  reads_300bp  validated  cap_signal  backbone
-//          reads per window (bp:count, ...)
-//   library  labelled  capped  cap_signal  threshold  candidates   (predict, before phase C)
+//          reads per window (bp:count, ...)  reads_upstream  reads_downstream (26-300 bp)
+//   library  labelled  capped  cap_signal  threshold  candidates  sharpness   (predict)
 //   lead   n_leading_bases  first_base  reads        (summary, written by `close_start_dump`)
 
 static START_DUMP: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();

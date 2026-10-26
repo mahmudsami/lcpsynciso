@@ -243,7 +243,9 @@ fn find_validated_starts(
         };
         if dump {
             // Reads starting within each of several windows, for choosing the sharpness
-            // window; and the backbone, for placing the candidate on an annotation.
+            // window; the backbone, for placing the candidate on an annotation; and the
+            // reads starting upstream and downstream of the peak within `SHARP_WINDOW` but
+            // outside `START_RADIUS`, for a sharpness on each side.
             let windows: Vec<String> = DUMP_WINDOWS
                 .iter()
                 .map(|&w| {
@@ -251,13 +253,18 @@ fn find_validated_starts(
                     format!("{w}:{c}")
                 })
                 .collect();
+            let flank = |lo: i32, hi: i32| {
+                group.iter().filter(|&&(_, start, _)| (lo..=hi).contains(&(start - peak))).count()
+            };
             stats::start_dump(format!(
-                "cand\t{peak}\t{}\t{n}\t{g}\t{near}\t{}\t{}\t{}\t{}",
+                "cand\t{peak}\t{}\t{n}\t{g}\t{near}\t{}\t{}\t{}\t{}\t{}\t{}",
                 peak_reads.len(),
                 real as u8,
                 cap_signal as u8,
                 reads[backbone_idx].name,
-                windows.join(",")
+                windows.join(","),
+                flank(-SHARP_WINDOW, -START_RADIUS - 1),
+                flank(START_RADIUS + 1, SHARP_WINDOW)
             ));
         }
         if real {
