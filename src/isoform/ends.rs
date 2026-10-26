@@ -45,6 +45,8 @@ const MIN_CAPPED: f64 = 0.7;
 /// cDNA 27% (template and strand switching), ONT direct RNA 12% and SIRV spike-ins 4% (none).
 const CAP_LIBRARY: f64 = 0.2;
 const MIN_CAP_READS: usize = 10;
+/// Outer windows (bp) recorded by --dump-starts, for choosing the sharpness window.
+const DUMP_WINDOWS: [i32; 9] = [50, 100, 150, 200, 300, 500, 750, 1000, 1500];
 /// Fewest start candidates with labelled reads for setting the library's threshold from
 /// their capped shares; with fewer, `MIN_CAPPED` is used.
 const MIN_LIBRARY_CANDIDATES: usize = 100;
@@ -238,11 +240,22 @@ fn find_validated_starts(
             peak_reads.len() as f64 >= MIN_SHARPNESS * near as f64
         };
         if dump {
+            // Reads starting within each of several windows, for choosing the sharpness
+            // window; and the backbone, for placing the candidate on an annotation.
+            let windows: Vec<String> = DUMP_WINDOWS
+                .iter()
+                .map(|&w| {
+                    let c = group.iter().filter(|&&(_, start, _)| (start - peak).abs() <= w).count();
+                    format!("{w}:{c}")
+                })
+                .collect();
             stats::start_dump(format!(
-                "cand\t{peak}\t{}\t{n}\t{g}\t{near}\t{}\t{}",
+                "cand\t{peak}\t{}\t{n}\t{g}\t{near}\t{}\t{}\t{}\t{}",
                 peak_reads.len(),
                 real as u8,
-                cap_signal as u8
+                cap_signal as u8,
+                reads[backbone_idx].name,
+                windows.join(",")
             ));
         }
         if real {
