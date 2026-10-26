@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use super::anchors::{minimizer_map, MinimizerMap};
 use super::fit::{place_on_backbone, strip_homopolymer_ends};
-use super::{align, consensus, AltStarts, EndMerge, Isoform, IsoformOptions, Read};
+use super::{align, consensus, stats, AltStarts, EndMerge, Isoform, IsoformOptions, Read};
 
 /// Merge duplicate isoforms among `isoforms`, whose members index `reads` (with minimizer maps
 /// `read_maps`, used to rebuild a consensus).
@@ -62,17 +62,24 @@ pub(super) fn merge_duplicates(
     let mut merged_into: Vec<Option<usize>> = vec![None; n]; // merged isoform -> kept isoform
     let mut rebuild = vec![false; n]; // kept isoform absorbed a more complete copy of itself
     let mut kept: Vec<usize> = Vec::new();
+    // --dump-merges: ids for these isoforms, and whose consensus is written already
+    let first_id = if stats::merge_dump_on() { Some(stats::merge_ids(n)) } else { None };
+    let mut written = vec![false; n];
     for i in 0..n {
         let mut into = None;
         for &j in &kept {
-            match decide_merge(
+            let decision = decide_merge(
                 &isoforms[i],
                 &isoforms[j],
                 &consensus_maps[i],
                 &consensus_maps[j],
                 options,
                 &strict,
-            ) {
+            );
+            if let Some(first_id) = first_id {
+                dump_pair((i, j), &isoforms, &consensus_maps, options, &strict, &decision, first_id, &mut written);
+            }
+            match decision {
                 MergeDecision::KeepSeparate => continue,
                 MergeDecision::Merge => {}
                 MergeDecision::MergeAndRebuild => rebuild[j] = true,
@@ -111,6 +118,69 @@ pub(super) fn merge_duplicates(
         }
     }
     kept_isoforms
+}
+
+/// --dump-merges: isoform `i` (the smaller) compared with the larger `j`, when their
+/// consensuses are near-identical or one contains the other (`stats::merge_dump`).
+#[allow(clippy::too_many_arguments)]
+fn dump_pair(
+    (i, j): (usize, usize),
+    isoforms: &[Isoform],
+    maps: &[MinimizerMap],
+    options: &IsoformOptions,
+    strict: &IsoformOptions,
+    decision: &MergeDecision,
+    first_id: u64,
+    written: &mut [bool],
+) {
+    let (small, big) = (&isoforms[i], &isoforms[j]);
+    // the smaller's start and end minus the larger's, whatever the read counts
+    let offsets = if small.consensus.len() <= big.consensus.len() {
+        place_on_backbone(&maps[i], &maps[j], &small.consensus, &big.consensus, strict)
+            .map(|(start, end)| (start, end - big.consensus.len() as i32))
+    } else {
+        place_on_backbone(&maps[j], &maps[i], &big.consensus, &small.consensus, strict)
+            .map(|(start, end)| (-start, small.consensus.len() as i32 - end))
+    };
+    let identical = consensuses_near_identical(small, big, options);
+    let slack = options.collapse_gap as i32;
+    let relation = match offsets {
+        _ if identical => "identical",
+        None => return,
+        Some((d5, d3)) => match (d5 < -slack, d3 > slack) {
+            (false, false) => "inside",
+            (true, false) => "further5",
+            (false, true) => "further3",
+            (true, true) => "both",
+        },
+    };
+    let (d5, d3) = offsets.map_or(("NA".into(), "NA".into()), |(a, b)| (a.to_string(), b.to_string()));
+    let decision = match decision {
+        MergeDecision::KeepSeparate => "keep",
+        MergeDecision::Merge => "merge",
+        MergeDecision::MergeAndRebuild => "rebuild",
+    };
+    let mut consensuses: Vec<(u64, &[u8])> = Vec::new();
+    for k in [i, j] {
+        if !written[k] {
+            written[k] = true;
+            consensuses.push((first_id + k as u64, &isoforms[k].consensus));
+        }
+    }
+    stats::merge_dump(
+        format!(
+            "pair\tm{}\tm{}\t{}\t{}\t{}\t{}\t{}\t{}\t{relation}\t{d5}\t{d3}\t{decision}",
+            first_id + i as u64,
+            first_id + j as u64,
+            small.members.len(),
+            big.members.len(),
+            small.consensus.len(),
+            big.consensus.len(),
+            small.alt_start as u8,
+            big.alt_start as u8
+        ),
+        &consensuses,
+    );
 }
 
 /// How `small` relates to a larger isoform it may merge into.

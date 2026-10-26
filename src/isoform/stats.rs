@@ -190,6 +190,57 @@ pub(crate) fn record_lead(lead: usize, first_base: u8) {
     H_LEAD[lead.min(3)][b].fetch_add(1, Relaxed);
 }
 
+// ── `--dump-merges`: the pairs merging compares (`collapse::merge_duplicates`) ────────────
+//
+// Off unless `open_merge_dump` was called; the isoforms are the same either way. One line per
+// pair compared, the smaller isoform (fewer reads) against a larger one kept so far, when the
+// consensuses are near-identical or one contains the other:
+//   pair  small_id  big_id  small_reads  big_reads  small_len  big_len  small_alt  big_alt
+//         relation  d5  d3  decision
+// relation: identical (near-identical consensuses), inside / further5 / further3 / both (how
+// the smaller reaches past the larger, by more than --collapse-gap);
+// d5 / d3: the smaller's start / end minus the larger's (bp; NA if near-identical without
+// containment);
+// decision: keep / merge / rebuild. FILE.fa holds the consensus of every isoform in a pair.
+
+static MERGE_DUMP: OnceLock<Mutex<(BufWriter<File>, BufWriter<File>)>> = OnceLock::new();
+static MERGE_IDS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn open_merge_dump(path: &str) {
+    let mut w = BufWriter::new(File::create(path).expect("cannot create --dump-merges file"));
+    writeln!(w, "# lcpsynciso --dump-merges: pair lines, see stats.rs").unwrap();
+    let fa = File::create(format!("{path}.fa")).expect("cannot create the --dump-merges FASTA");
+    MERGE_DUMP.set(Mutex::new((w, BufWriter::new(fa)))).ok();
+}
+
+pub(crate) fn merge_dump_on() -> bool {
+    MERGE_DUMP.get().is_some()
+}
+
+/// The first of `n` fresh isoform ids for the merge dump.
+pub(crate) fn merge_ids(n: usize) -> u64 {
+    MERGE_IDS.fetch_add(n as u64, Relaxed)
+}
+
+/// A pair line, and the consensuses of its isoforms not written before.
+pub(crate) fn merge_dump(line: String, consensuses: &[(u64, &[u8])]) {
+    if let Some(w) = MERGE_DUMP.get() {
+        let mut w = w.lock().unwrap();
+        writeln!(w.0, "{line}").unwrap();
+        for (id, seq) in consensuses {
+            writeln!(w.1, ">m{id}\n{}", String::from_utf8_lossy(seq)).unwrap();
+        }
+    }
+}
+
+pub(crate) fn close_merge_dump() {
+    if let Some(w) = MERGE_DUMP.get() {
+        let mut w = w.lock().unwrap();
+        w.0.flush().unwrap();
+        w.1.flush().unwrap();
+    }
+}
+
 pub(crate) fn close_start_dump() {
     if let Some(w) = START_DUMP.get() {
         let mut w = w.lock().unwrap();

@@ -55,6 +55,8 @@ pub struct Config {
     pub dump_clusters: bool,
     // Write what start validation sees to this file (`--dump-starts`; diagnostics only).
     pub dump_starts: Option<String>,
+    // Write the pairs merging compares to this file (`--dump-merges`; diagnostics only).
+    pub dump_merges: Option<String>,
     // Isoform detection.
     pub isoform_options: IsoformOptions,
 }
@@ -81,6 +83,7 @@ impl Default for Config {
             max_cluster_size: usize::MAX,
             dump_clusters: false,
             dump_starts: None,
+            dump_merges: None,
             isoform_options: IsoformOptions::default(),
         }
     }
@@ -122,6 +125,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--iso-w" => config.isoform_options.minimizer_w = next().parse().unwrap(),
             "--dump-clusters" => config.dump_clusters = true,
             "--dump-starts" => config.dump_starts = Some(next()),
+            "--dump-merges" => config.dump_merges = Some(next()),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -164,6 +168,9 @@ GENERAL:
     --dump-clusters         also write gene_clusters.tsv (phase B clusters)
     --dump-starts FILE      write what start validation sees (start peaks, labelled
                             and capped reads per structure group) to FILE
+    --dump-merges FILE      write the isoform pairs merging compares (read counts,
+                            containment, decision) to FILE and their consensuses
+                            to FILE.fa
 
 CLUSTERING (seeds):
     --k N / --s N           k-mer / s-mer length                         [15 / 9]
@@ -258,6 +265,9 @@ pub fn run(config: Config) {
     // ── Phase C: detect isoforms ──
     if let Some(path) = &config.dump_starts {
         isoform::stats::open_start_dump(path);
+    }
+    if let Some(path) = &config.dump_merges {
+        isoform::stats::open_merge_dump(path);
     }
     let phase_c_start = Instant::now();
     let mut eligible_clusters: Vec<u32> = (0..n_clusters as u32)
@@ -364,6 +374,7 @@ pub fn run(config: Config) {
     });
     let (total_isoforms, n_processed_clusters) = writer.into_inner().unwrap().finish();
     isoform::stats::close_start_dump();
+    isoform::stats::close_merge_dump();
     let phase_c_time = phase_c_start.elapsed();
 
     // ── Report ──
