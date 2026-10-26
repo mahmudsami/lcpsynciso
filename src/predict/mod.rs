@@ -306,7 +306,12 @@ pub fn run(config: Config) {
                     library_stats.candidates.len()
                 )
             } else {
-                "off: starts are validated as sharp peaks".to_string()
+                format!(
+                    "off: a start needs {:.0}% of the reads starting within 300 bp to start within \
+                     25 bp of it ({} start candidates)",
+                    100.0 * library.sharpness,
+                    library_stats.sharpness.len()
+                )
             };
             eprintln!(
                 "[predict] start validation: {} of {} labelled reads capped ({:.1}%) -> cap signal {}",
@@ -316,12 +321,13 @@ pub fn run(config: Config) {
                 rule
             );
             isoform::stats::start_dump(format!(
-                "library\t{}\t{}\t{}\t{}\t{}",
+                "library\t{}\t{}\t{}\t{}\t{}\t{}",
                 library_stats.labelled,
                 library_stats.capped,
                 library.cap_signal as u8,
                 library.threshold,
-                library_stats.candidates.len()
+                library_stats.candidates.len(),
+                library.sharpness
             ));
             options.start_library = Some(library);
             groups_by_position

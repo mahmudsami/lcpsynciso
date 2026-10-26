@@ -23,12 +23,14 @@ pub enum CapSignal {
     Off,
 }
 
-/// How start validation reads the untemplated G in one library: whether the library shows the
-/// cap signal at all, and the share of a start candidate's labelled reads that must carry it.
+/// How start validation works in one library: whether the library shows the cap signal at
+/// all, the share of a start candidate's labelled reads that must carry the untemplated G (with
+/// a cap signal), and how sharp a candidate must be (without one).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StartLibrary {
     pub cap_signal: bool,
     pub threshold: f64,
+    pub sharpness: f64,
 }
 
 /// Whether merging may fold an isoform at a validated start into the one it lies inside
@@ -92,7 +94,10 @@ pub struct IsoformOptions {
     /// Share of a candidate's labelled reads that must be capped (`--cap-threshold`); None
     /// sets it from the library.
     pub cap_threshold: Option<f64>,
-    /// The library's cap signal and threshold, once known; None decides per structure group.
+    /// How sharp a start candidate must be without a cap signal (`--sharp-threshold`); None
+    /// sets it from the library.
+    pub sharp_threshold: Option<f64>,
+    /// The library's cap signal and thresholds, once known; None decides per structure group.
     pub start_library: Option<StartLibrary>,
 
     // Step 3: isoforms.
@@ -133,6 +138,7 @@ impl Default for IsoformOptions {
             boundary_tol: 150,
             cap_signal: CapSignal::Auto,
             cap_threshold: None,
+            sharp_threshold: None,
             start_library: None,
             min_iso: 3,
             collapse_gap: 3,
@@ -189,6 +195,12 @@ pub(crate) fn apply_isoform_flag(
         }
         "--cap-threshold" => {
             options.cap_threshold = match next().as_str() {
+                "auto" => None,
+                value => Some(value.parse().unwrap()),
+            }
+        }
+        "--sharp-threshold" => {
+            options.sharp_threshold = match next().as_str() {
                 "auto" => None,
                 value => Some(value.parse().unwrap()),
             }
@@ -263,6 +275,11 @@ READ ENDS (a structure group splits into isoforms by where its reads start and e
                             carry the G for a real start; auto: the cut between
                             the two modes of this share over the library's start
                             peaks (Otsu)
+    --sharp-threshold F|auto
+                            without a cap signal, the share of the reads [auto]
+                            starting within 300 bp of a start peak that must
+                            start within 25 bp of it; auto: the Otsu cut over the
+                            library's start peaks (predict)
 
 MERGING (near-identical isoforms, after consensus):
     --collapse-gap N        max gap or length difference (bp) to merge   [3]

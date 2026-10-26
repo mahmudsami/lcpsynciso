@@ -33,8 +33,9 @@ const NO_START: i32 = i32::MIN;
 const START_RADIUS: i32 = 25;
 /// Sharpness compares the starts within `START_RADIUS` with those within this many bp.
 const SHARP_WINDOW: i32 = 300;
-/// Without a cap signal, a peak this sharp is a real start. SIRV: truncation peaks mostly
-/// below 0.3-0.5, real starts that --start-split off merged away at 0.95-1.00.
+/// Without a cap signal and without a threshold from the library (`find-isoforms`, or too few
+/// start candidates), a peak this sharp is a real start. The library's Otsu cut fell at
+/// 0.41-0.49 on SIRV (HiFi, ONT cDNA, ONT direct RNA) and UHRR (same three) start peaks.
 const MIN_SHARPNESS: f64 = 0.45;
 /// With a cap signal and no threshold from the library (`find-isoforms`, or too few start
 /// candidates), a peak whose reads carry an untemplated 5' G at least this often is a real start.
@@ -204,8 +205,8 @@ fn find_validated_starts(
             .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize))
     };
     let (known, with_g) = tally(&mut (0..group.len()));
-    let (cap_signal, min_capped) = match options.start_library {
-        Some(library) => (library.cap_signal, library.threshold),
+    let (cap_signal, min_capped, min_sharpness) = match options.start_library {
+        Some(library) => (library.cap_signal, library.threshold, library.sharpness),
         None => (
             match options.cap_signal {
                 CapSignal::On => true,
@@ -215,6 +216,7 @@ fn find_validated_starts(
                 }
             },
             options.cap_threshold.unwrap_or(MIN_CAPPED),
+            options.sharp_threshold.unwrap_or(MIN_SHARPNESS),
         ),
     };
     if dump {
@@ -237,7 +239,7 @@ fn find_validated_starts(
         let real = if cap_signal {
             n >= options.min_iso && g as f64 >= min_capped * n as f64
         } else {
-            peak_reads.len() as f64 >= MIN_SHARPNESS * near as f64
+            peak_reads.len() as f64 >= min_sharpness * near as f64
         };
         if dump {
             // Reads starting within each of several windows, for choosing the sharpness
@@ -267,12 +269,14 @@ fn find_validated_starts(
 
 /// What start validation sees across a library: its labelled reads (start more than
 /// `START_RADIUS` into the backbone, with an exact match there), how many of them carry an
-/// untemplated G, and the capped share of every start candidate with `min_iso` labelled reads.
+/// untemplated G, the capped share of every start candidate with `min_iso` labelled reads, and
+/// the sharpness of every start candidate.
 #[derive(Default)]
 pub(crate) struct StartStats {
     pub labelled: u64,
     pub capped: u64,
     pub candidates: Vec<f32>,
+    pub sharpness: Vec<f32>,
 }
 
 impl StartStats {
@@ -280,12 +284,15 @@ impl StartStats {
         self.labelled += other.labelled;
         self.capped += other.capped;
         self.candidates.extend(other.candidates);
+        self.sharpness.extend(other.sharpness);
     }
 
-    /// The library's cap signal and threshold, unless set on the command line. The cap signal
-    /// is on when at least `CAP_LIBRARY` of the labelled reads are capped. The threshold is
+    /// The library's cap signal and thresholds, unless set on the command line. The cap signal
+    /// is on when at least `CAP_LIBRARY` of the labelled reads are capped. The cap threshold is
     /// the cut between the two modes of the candidates' capped shares, truncation peaks near
-    /// none and real starts near all (Otsu); `MIN_CAPPED` with too few candidates.
+    /// none and real starts near all (Otsu); the sharpness threshold is the Otsu cut over the
+    /// candidates' sharpness, diffuse truncation against tight starts. With fewer than
+    /// `MIN_LIBRARY_CANDIDATES` candidates, `MIN_CAPPED` and `MIN_SHARPNESS`.
     pub(crate) fn library(&self, options: &IsoformOptions) -> StartLibrary {
         let cap_signal = match options.cap_signal {
             CapSignal::On => true,
@@ -302,7 +309,14 @@ impl StartStats {
                 MIN_CAPPED
             }
         });
-        StartLibrary { cap_signal, threshold }
+        let sharpness = options.sharp_threshold.unwrap_or_else(|| {
+            if self.sharpness.len() >= MIN_LIBRARY_CANDIDATES {
+                otsu_threshold(&self.sharpness)
+            } else {
+                MIN_SHARPNESS
+            }
+        });
+        StartLibrary { cap_signal, threshold, sharpness }
     }
 }
 
@@ -329,13 +343,19 @@ pub(super) fn add_start_stats(
     acc.capped += capped.iter().flatten().filter(|&&c| c).count() as u64;
     let peaks = find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso);
     for peak in peaks.into_iter().filter(|&peak| peak > START_RADIUS) {
-        let (n, g) = (0..group.len())
+        let near: Vec<usize> = (0..group.len())
             .filter(|&group_pos| (group[group_pos].1 - peak).abs() <= START_RADIUS)
-            .filter_map(|group_pos| capped[group_pos])
+            .collect();
+        let (n, g) = near
+            .iter()
+            .filter_map(|&group_pos| capped[group_pos])
             .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize));
         if n >= options.min_iso {
             acc.candidates.push(g as f32 / n as f32);
         }
+        let around =
+            group.iter().filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW).count();
+        acc.sharpness.push(near.len() as f32 / around as f32);
     }
 }
 
@@ -551,14 +571,34 @@ mod tests {
 
     #[test]
     fn the_library_decides_the_cap_signal_and_threshold() {
-        let stats = StartStats { labelled: 1000, capped: 400, candidates: vec![0.05; 200] };
+        let stats = StartStats {
+            labelled: 1000,
+            capped: 400,
+            candidates: vec![0.05; 200],
+            sharpness: Vec::new(),
+        };
         let auto = IsoformOptions::default();
         assert!(stats.library(&auto).cap_signal);
-        let few = StartStats { labelled: 1000, capped: 100, candidates: Vec::new() };
+        let few = StartStats { labelled: 1000, capped: 100, ..StartStats::default() };
         assert!(!few.library(&auto).cap_signal);
         assert_eq!(few.library(&auto).threshold, MIN_CAPPED);
-        let set = IsoformOptions { cap_signal: CapSignal::On, cap_threshold: Some(0.5), ..auto };
-        assert_eq!(few.library(&set), StartLibrary { cap_signal: true, threshold: 0.5 });
+        assert_eq!(few.library(&auto).sharpness, MIN_SHARPNESS);
+        let set = IsoformOptions {
+            cap_signal: CapSignal::On,
+            cap_threshold: Some(0.5),
+            sharp_threshold: Some(0.3),
+            ..auto
+        };
+        assert_eq!(
+            few.library(&set),
+            StartLibrary { cap_signal: true, threshold: 0.5, sharpness: 0.3 }
+        );
+        // without a cap signal, the sharpness threshold comes from the candidates
+        let mut sharp: Vec<f32> = (0..300).map(|i| (i % 20) as f32 / 100.0).collect();
+        sharp.extend((0..100).map(|i| 0.8 + (i % 20) as f32 / 100.0));
+        let uncapped = StartStats { labelled: 1000, capped: 50, sharpness: sharp, ..StartStats::default() };
+        let cut = uncapped.library(&auto).sharpness;
+        assert!((0.19..=0.8).contains(&cut), "{cut}");
     }
 
     #[test]
