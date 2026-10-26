@@ -40,7 +40,7 @@ pub(crate) mod stats; // diagnostic counters
 
 use anchors::MinimizerMap;
 pub use find_isoforms::{parse_args, run, print_usage, Config};
-pub use options::{AltStarts, EndMerge, IsoformOptions, StartSplit};
+pub use options::{AltStarts, CapSignal, EndMerge, IsoformOptions, StartLibrary, StartSplit};
 pub(crate) use options::{apply_isoform_flag, ISOFORM_HELP};
 pub(crate) use output::{format_cluster_records, OutputFiles, ClusterRecords};
 
@@ -62,20 +62,72 @@ pub(crate) struct Isoform {
 
 /// A read placed on its group's backbone: (read_idx, start, end), with start and end in
 /// backbone coordinates.
-type PlacedRead = (usize, i32, i32);
+pub(crate) type PlacedRead = (usize, i32, i32);
+
+pub(crate) use ends::StartStats;
 
 /// Detect the isoforms in one cluster's reads. Clusters are independent, so callers can
 /// detect many at once.
 pub(crate) fn detect_isoforms(reads: &[Read], options: &IsoformOptions) -> Vec<Isoform> {
+    let read_maps = minimizer_maps(reads, options);
+    let lap_start = Instant::now();
+    let groups = group_by_structure(reads, &read_maps, options);
+    stats::add_elapsed(&stats::T_PARTITION, lap_start);
+    isoforms_from_groups(reads, &read_maps, &groups, options)
+}
+
+/// Step 1 alone: the structure groups of one cluster's reads, for a caller that first
+/// gathers what start validation sees across the library (`start_stats`) and then detects
+/// the isoforms from the same groups (`detect_isoforms_in_groups`).
+pub(crate) fn structure_groups(reads: &[Read], options: &IsoformOptions) -> Vec<Vec<PlacedRead>> {
+    let read_maps = minimizer_maps(reads, options);
+    let lap_start = Instant::now();
+    let groups = group_by_structure(reads, &read_maps, options);
+    stats::add_elapsed(&stats::T_PARTITION, lap_start);
+    groups
+}
+
+/// What start validation sees in one cluster's structure groups.
+pub(crate) fn start_stats(
+    reads: &[Read],
+    groups: &[Vec<PlacedRead>],
+    options: &IsoformOptions,
+) -> StartStats {
+    let mut acc = StartStats::default();
+    for group in groups {
+        ends::add_start_stats(group, reads, group[0].0, options, &mut acc);
+    }
+    acc
+}
+
+/// Steps 2-4 on structure groups from `structure_groups`.
+pub(crate) fn detect_isoforms_in_groups(
+    reads: &[Read],
+    groups: &[Vec<PlacedRead>],
+    options: &IsoformOptions,
+) -> Vec<Isoform> {
+    let read_maps = minimizer_maps(reads, options);
+    isoforms_from_groups(reads, &read_maps, groups, options)
+}
+
+fn minimizer_maps(reads: &[Read], options: &IsoformOptions) -> Vec<MinimizerMap> {
     let lap_start = Instant::now();
     let read_maps: Vec<MinimizerMap> = reads
         .iter()
         .map(|read| anchors::minimizer_map(&read.seq, options.minimizer_k, options.minimizer_w))
         .collect();
     stats::add_elapsed(&stats::T_MAPS, lap_start);
+    read_maps
+}
 
+fn isoforms_from_groups(
+    reads: &[Read],
+    read_maps: &[MinimizerMap],
+    groups: &[Vec<PlacedRead>],
+    options: &IsoformOptions,
+) -> Vec<Isoform> {
     let lap_start = Instant::now();
-    let (drafts, reads_by_group) = partition(reads, &read_maps, options);
+    let (drafts, reads_by_group) = partition(reads, groups, options);
     stats::add_elapsed(&stats::T_PARTITION, lap_start);
 
     let lap_start = Instant::now();
@@ -86,29 +138,29 @@ pub(crate) fn detect_isoforms(reads: &[Read], options: &IsoformOptions) -> Vec<I
                 reads,
                 &members,
                 &reads_by_group[group_index],
-                &read_maps,
+                read_maps,
             );
             Isoform { members, consensus, alt_start }
         })
         .collect();
     stats::add_elapsed(&stats::T_CONS, lap_start);
 
-    collapse::merge_duplicates(isoforms, reads, &read_maps, options)
+    collapse::merge_duplicates(isoforms, reads, read_maps, options)
 }
 
-/// Steps 1–2 and the `min_iso` filter. Returns the drafts (isoforms that have reads but no
-/// consensus yet), largest first, each as its read indices, whether it starts at a validated
-/// downstream start, and the `group_index` of its structure group in the second list, which
-/// holds each group's reads: they share the isoform's structure, so they may vote in its
-/// consensus.
+/// Step 2 and the `min_iso` filter on the structure groups. Returns the drafts (isoforms that
+/// have reads but no consensus yet), largest first, each as its read indices, whether it
+/// starts at a validated downstream start, and the `group_index` of its structure group in the
+/// second list, which holds each group's reads: they share the isoform's structure, so they
+/// may vote in its consensus.
 fn partition(
     reads: &[Read],
-    read_maps: &[MinimizerMap],
+    groups: &[Vec<PlacedRead>],
     options: &IsoformOptions,
 ) -> (Vec<(Vec<usize>, bool, usize)>, Vec<Vec<usize>>) {
     let mut drafts: Vec<(Vec<usize>, bool, usize)> = Vec::new();
     let mut reads_by_group: Vec<Vec<usize>> = Vec::new();
-    for group in &group_by_structure(reads, read_maps, options) {
+    for group in groups {
         let (backbone_idx, _, _) = group[0];
         let group_index = reads_by_group.len();
         reads_by_group.push(group.iter().map(|&(read_idx, _, _)| read_idx).collect());

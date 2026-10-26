@@ -96,7 +96,10 @@ order needs it, because the longest reads start clusters first.
    default) is `off` plus: a downstream start peak that looks like a real transcription
    start keeps its reads as an isoform of its own, beside the full-length one. In capped cDNA (template
    switching) that means most of its reads carry an untemplated 5' G; without that signal
-   (direct RNA, spike-ins), a sharp peak.
+   (direct RNA, spike-ins), a sharp peak. `predict` decides both from the whole library
+   before detecting isoforms: the cap signal is on when at least 20% of the reads that can
+   show the G carry it, and the share a start needs is the cut between the two modes of
+   that share over all start peaks (Otsu). `--cap-signal` and `--cap-threshold` set them.
 3. **Consensus.** The longest read is cut into windows at minimizers carried by a majority
    of the reads covering that position (at least 2); each window takes the most frequent
    read substring. Where fewer than 3 of the isoform's own reads cover a position, the other

@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{stats, PlacedRead, Read, IsoformOptions, StartSplit};
+use super::{stats, CapSignal, IsoformOptions, PlacedRead, Read, StartLibrary, StartSplit};
 
 /// Start key of the reads at no validated start: the full-length isoform and its truncated
 /// copies.
@@ -36,14 +36,18 @@ const SHARP_WINDOW: i32 = 300;
 /// Without a cap signal, a peak this sharp is a real start. SIRV: truncation peaks mostly
 /// below 0.3-0.5, real starts that --start-split off merged away at 0.95-1.00.
 const MIN_SHARPNESS: f64 = 0.45;
-/// With a cap signal, a peak whose reads carry an untemplated 5' G at least this often is a
-/// real start. UHRR HiFi: annotated starts ~97-100%, truncation peaks ~50%.
+/// With a cap signal and no threshold from the library (`find-isoforms`, or too few start
+/// candidates), a peak whose reads carry an untemplated 5' G at least this often is a real start.
 const MIN_CAPPED: f64 = 0.7;
-/// A group shows the cap signal when at least this share of its informative reads carry an
-/// untemplated G, out of at least `MIN_CAP_READS`. Libraries without template switching
-/// (direct RNA, uncapped spike-ins) show almost none.
+/// A library (with `find-isoforms`, a structure group) shows the cap signal when at least
+/// this share of its labelled reads carry an untemplated G, out of at least `MIN_CAP_READS`.
+/// Capped share of labelled reads measured with --dump-starts: UHRR PacBio HiFi 41% and ONT
+/// cDNA 27% (template and strand switching), ONT direct RNA 12% and SIRV spike-ins 4% (none).
 const CAP_LIBRARY: f64 = 0.2;
 const MIN_CAP_READS: usize = 10;
+/// Fewest start candidates with labelled reads for setting the library's threshold from
+/// their capped shares; with fewer, `MIN_CAPPED` is used.
+const MIN_LIBRARY_CANDIDATES: usize = 100;
 
 /// Read indices of each isoform found in `group`, and whether it starts at a validated
 /// downstream start, in no particular order. `group` sits on `reads[backbone_idx]`.
@@ -154,11 +158,11 @@ pub(super) fn split_by_ends(
 /// Start peaks inside the backbone that look like real transcription starts rather than 5'
 /// truncation, ascending. The backbone reaches further 5', so each is a candidate alternative
 /// start of a longer transcript. A candidate needs `min_iso` reads within `START_RADIUS`, and
-///   * if the group shows a cap signal (template switching adds an untemplated G at a capped
-///     5' end), `MIN_CAPPED` of them carrying an untemplated G;
+///   * if the library shows a cap signal (template switching adds an untemplated G at a capped
+///     5' end), the library's share of them carrying an untemplated G (`StartLibrary`);
 ///   * otherwise (direct RNA, uncapped spike-ins), a sharp peak: `MIN_SHARPNESS` of the starts
 ///     within `SHARP_WINDOW`.
-/// Thresholds are from UHRR HiFi against GENCODE and SIRV spike-ins against their annotation.
+/// Without a library decision (`find-isoforms`), the cap signal is decided per structure group.
 fn find_validated_starts(
     group: &[PlacedRead],
     reads: &[Read],
@@ -198,7 +202,19 @@ fn find_validated_starts(
             .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize))
     };
     let (known, with_g) = tally(&mut (0..group.len()));
-    let cap_signal = known >= MIN_CAP_READS && with_g as f64 >= CAP_LIBRARY * known as f64;
+    let (cap_signal, min_capped) = match options.start_library {
+        Some(library) => (library.cap_signal, library.threshold),
+        None => (
+            match options.cap_signal {
+                CapSignal::On => true,
+                CapSignal::Off => false,
+                CapSignal::Auto => {
+                    known >= MIN_CAP_READS && with_g as f64 >= CAP_LIBRARY * known as f64
+                }
+            },
+            options.cap_threshold.unwrap_or(MIN_CAPPED),
+        ),
+    };
     if dump {
         stats::start_dump(format!("group\t{}\t{known}\t{with_g}\t{}", group.len(), cap_signal as u8));
     }
@@ -217,7 +233,7 @@ fn find_validated_starts(
             .filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW)
             .count();
         let real = if cap_signal {
-            n >= options.min_iso && g as f64 >= MIN_CAPPED * n as f64
+            n >= options.min_iso && g as f64 >= min_capped * n as f64
         } else {
             peak_reads.len() as f64 >= MIN_SHARPNESS * near as f64
         };
@@ -234,6 +250,110 @@ fn find_validated_starts(
         }
     }
     validated
+}
+
+/// What start validation sees across a library: its labelled reads (start more than
+/// `START_RADIUS` into the backbone, with an exact match there), how many of them carry an
+/// untemplated G, and the capped share of every start candidate with `min_iso` labelled reads.
+#[derive(Default)]
+pub(crate) struct StartStats {
+    pub labelled: u64,
+    pub capped: u64,
+    pub candidates: Vec<f32>,
+}
+
+impl StartStats {
+    pub(crate) fn merge(&mut self, other: StartStats) {
+        self.labelled += other.labelled;
+        self.capped += other.capped;
+        self.candidates.extend(other.candidates);
+    }
+
+    /// The library's cap signal and threshold, unless set on the command line. The cap signal
+    /// is on when at least `CAP_LIBRARY` of the labelled reads are capped. The threshold is
+    /// the cut between the two modes of the candidates' capped shares, truncation peaks near
+    /// none and real starts near all (Otsu); `MIN_CAPPED` with too few candidates.
+    pub(crate) fn library(&self, options: &IsoformOptions) -> StartLibrary {
+        let cap_signal = match options.cap_signal {
+            CapSignal::On => true,
+            CapSignal::Off => false,
+            CapSignal::Auto => {
+                self.labelled >= MIN_CAP_READS as u64
+                    && self.capped as f64 >= CAP_LIBRARY * self.labelled as f64
+            }
+        };
+        let threshold = options.cap_threshold.unwrap_or_else(|| {
+            if self.candidates.len() >= MIN_LIBRARY_CANDIDATES {
+                otsu_threshold(&self.candidates)
+            } else {
+                MIN_CAPPED
+            }
+        });
+        StartLibrary { cap_signal, threshold }
+    }
+}
+
+/// Add what start validation sees in `group`, sitting on `reads[backbone_idx]`, to `acc`.
+pub(super) fn add_start_stats(
+    group: &[PlacedRead],
+    reads: &[Read],
+    backbone_idx: usize,
+    options: &IsoformOptions,
+    acc: &mut StartStats,
+) {
+    let width = options.peak_width.max(1) as i32;
+    let backbone_seq = &reads[backbone_idx].seq;
+    let capped: Vec<Option<bool>> = group
+        .iter()
+        .map(|&(read_idx, start, _)| {
+            (start > START_RADIUS)
+                .then(|| untemplated_lead(&reads[read_idx].seq, backbone_seq, start as usize))
+                .flatten()
+                .map(|(n, first)| n > 0 && first == b'G')
+        })
+        .collect();
+    acc.labelled += capped.iter().flatten().count() as u64;
+    acc.capped += capped.iter().flatten().filter(|&&c| c).count() as u64;
+    let peaks = find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso);
+    for peak in peaks.into_iter().filter(|&peak| peak > START_RADIUS) {
+        let (n, g) = (0..group.len())
+            .filter(|&group_pos| (group[group_pos].1 - peak).abs() <= START_RADIUS)
+            .filter_map(|group_pos| capped[group_pos])
+            .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize));
+        if n >= options.min_iso {
+            acc.candidates.push(g as f32 / n as f32);
+        }
+    }
+}
+
+/// Otsu's threshold for values in [0, 1]: over 100 bins, the cut that maximises the variance
+/// between the values below and above it.
+fn otsu_threshold(values: &[f32]) -> f64 {
+    const BINS: usize = 100;
+    let mut hist = [0u64; BINS];
+    for &v in values {
+        hist[((v as f64 * BINS as f64) as usize).min(BINS - 1)] += 1;
+    }
+    let mid = |bin: usize| (bin as f64 + 0.5) / BINS as f64;
+    let n: u64 = hist.iter().sum();
+    let total: f64 = hist.iter().enumerate().map(|(bin, &c)| mid(bin) * c as f64).sum();
+    let (mut below, mut below_sum) = (0u64, 0f64);
+    let (mut best, mut cut) = (-1f64, MIN_CAPPED);
+    for t in 1..BINS {
+        below += hist[t - 1];
+        below_sum += mid(t - 1) * hist[t - 1] as f64;
+        let above = n - below;
+        if below == 0 || above == 0 {
+            continue;
+        }
+        let gap = below_sum / below as f64 - (total - below_sum) / above as f64;
+        let between = below as f64 * above as f64 * gap * gap;
+        if between > best {
+            best = between;
+            cut = t as f64 / BINS as f64;
+        }
+    }
+    cut
 }
 
 /// How `read_seq`, whose first matched base sits at backbone position `start`, begins: the
@@ -406,6 +526,26 @@ mod tests {
     fn without_start_split_full_length_reads_join_their_isoform() {
         let options = IsoformOptions { start_split: StartSplit::Off, ..IsoformOptions::default() };
         assert_eq!(sizes(&truncated_majority(), &options), vec![11]);
+    }
+
+    #[test]
+    fn otsu_cuts_between_two_modes() {
+        let mut values: Vec<f32> = (0..300).map(|i| (i % 10) as f32 / 100.0).collect();
+        values.extend((0..100).map(|i| 0.75 + (i % 20) as f32 / 100.0));
+        let cut = otsu_threshold(&values);
+        assert!(cut > 0.09 && cut <= 0.75, "{cut}");
+    }
+
+    #[test]
+    fn the_library_decides_the_cap_signal_and_threshold() {
+        let stats = StartStats { labelled: 1000, capped: 400, candidates: vec![0.05; 200] };
+        let auto = IsoformOptions::default();
+        assert!(stats.library(&auto).cap_signal);
+        let few = StartStats { labelled: 1000, capped: 100, candidates: Vec::new() };
+        assert!(!few.library(&auto).cap_signal);
+        assert_eq!(few.library(&auto).threshold, MIN_CAPPED);
+        let set = IsoformOptions { cap_signal: CapSignal::On, cap_threshold: Some(0.5), ..auto };
+        assert_eq!(few.library(&set), StartLibrary { cap_signal: true, threshold: 0.5 });
     }
 
     #[test]
