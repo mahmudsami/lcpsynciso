@@ -26,6 +26,16 @@ pub(crate) static N_GAPS_ALIGNED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static N_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Aligned interior gaps accepted as sequencing error.
 pub(crate) static N_GAPS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+/// Tests skipped because the k-mer index showed the read shares too few anchors with the
+/// backbone (`group_by_structure`); each would have been a few-anchors rejection.
+pub(crate) static N_NO_SHARED_ANCHORS: AtomicU64 = AtomicU64::new(0);
+/// Gaps rejected for the difference of their two lengths, without aligning (`--max-gap-jump`).
+pub(crate) static N_GAP_JUMPS: AtomicU64 = AtomicU64::new(0);
+/// Aligned gaps by the difference of their read and backbone lengths ([`JUMP_BUCKETS`]), as
+/// [aligned, accepted]: how often a length difference is still sequencing error.
+static H_JUMP: [[AtomicU64; 2]; 12] = [const { [const { AtomicU64::new(0) }; 2] }; 12];
+/// Lower bounds (bp) of the `H_JUMP` buckets.
+const JUMP_BUCKETS: [usize; 12] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64];
 /// Rejections, indexed by [`RejectReason`].
 static N_REJ: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Size histograms of aligned interior gaps and of flanks, bucketed by [`bucket`].
@@ -76,6 +86,15 @@ pub(crate) fn record_gap_size(len: usize) {
 #[inline]
 pub(crate) fn record_flank_size(len: usize) {
     inc(&H_FLANK[bucket(len)]);
+}
+
+#[inline]
+pub(crate) fn record_gap_jump(jump: usize, accepted: bool) {
+    let b = JUMP_BUCKETS.partition_point(|&lo| lo <= jump) - 1;
+    inc(&H_JUMP[b][0]);
+    if accepted {
+        inc(&H_JUMP[b][1]);
+    }
 }
 
 /// Histogram bucket: <32, 32-63, 64-127, 128-255, 256-511, >=512.
@@ -133,6 +152,23 @@ pub(crate) fn print_report() {
         N_ENCLOSED.load(Relaxed),
         N_DROP.load(Relaxed),
         N_ENCLOSED_WIDER.load(Relaxed)
+    );
+    eprintln!(
+        "[predict] === step 1: tests skipped by the k-mer index (too few shared anchors)={}  gaps rejected for their length difference={} ===",
+        N_NO_SHARED_ANCHORS.load(Relaxed),
+        N_GAP_JUMPS.load(Relaxed)
+    );
+    eprintln!(
+        "[predict] === aligned gaps by length difference (bp): {} ===",
+        (0..JUMP_BUCKETS.len())
+            .map(|i| {
+                let (n, ok) = (H_JUMP[i][0].load(Relaxed), H_JUMP[i][1].load(Relaxed));
+                let hi = JUMP_BUCKETS.get(i + 1).map_or("+".to_string(), |h| format!("-{}", h - 1));
+                let accepted = 100.0 * ok as f64 / n.max(1) as f64;
+                format!("{}{hi}: {n} ({accepted:.1}% accepted)", JUMP_BUCKETS[i])
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
     );
     let rejections = load(&N_REJ);
     let total = rejections.iter().sum::<u64>().max(1);

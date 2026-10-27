@@ -174,11 +174,20 @@ fn partition(
     (drafts, reads_by_group)
 }
 
+/// Clusters with at least this many reads find each backbone's candidate reads through a
+/// [`anchors::KmerIndex`]; smaller ones test every read, which the index would barely shorten.
+const INDEX_MIN_READS: usize = 32;
+
 /// Step 1. The first read of each group is its backbone, placed at [0, length].
 ///
 /// One round usually takes in a whole dominant structure, because every truncated copy of
 /// the longest read fits it; only reads of other structures carry over. A cluster holding
-/// one gene therefore costs about one test per read.
+/// one gene therefore costs about one test per read. Deep clusters hold many structures
+/// (rare isoforms, fragments, chimeras), so a read waits through many rounds, and most of the
+/// backbones it meets share no sequence with it: at 70M ONT cDNA reads, 81% of the tests
+/// failed for sharing fewer than `min_anchors` anchors. Such a read cannot fit, so in large
+/// clusters an index of every read's minimizers counts each read's shared anchors with the
+/// backbone first, and only reads with enough of them are tested; the groups are the same.
 fn group_by_structure(
     reads: &[Read],
     read_maps: &[MinimizerMap],
@@ -188,13 +197,29 @@ fn group_by_structure(
     let mut remaining: Vec<usize> = (0..reads.len()).collect();
     remaining.sort_by_key(|&read_idx| Reverse(reads[read_idx].seq.len()));
 
+    let index = (reads.len() >= INDEX_MIN_READS).then(|| anchors::KmerIndex::new(read_maps));
+    // Reads that left `remaining`: placed in a group, or a backbone.
+    let mut placed = vec![false; reads.len()];
+    let mut shared = vec![0u32; reads.len()];
+    let mut touched: Vec<u32> = Vec::new();
+
     let mut groups: Vec<Vec<PlacedRead>> = Vec::new();
     while !remaining.is_empty() {
         let backbone_idx = remaining[0];
+        placed[backbone_idx] = true;
+        if let Some(index) = &index {
+            index.count_shared(&read_maps[backbone_idx], &placed, &mut shared, &mut touched);
+        }
         let mut group: Vec<PlacedRead> =
             vec![(backbone_idx, 0, reads[backbone_idx].seq.len() as i32)];
         let mut rest: Vec<usize> = Vec::new();
         for &read_idx in &remaining[1..] {
+            if index.is_some() && (shared[read_idx] as usize) < options.min_anchors {
+                // `place_on_backbone` would reject it for too few anchors.
+                stats::inc(&stats::N_NO_SHARED_ANCHORS);
+                rest.push(read_idx);
+                continue;
+            }
             match fit::place_on_backbone(
                 &read_maps[read_idx],
                 &read_maps[backbone_idx],
@@ -202,12 +227,123 @@ fn group_by_structure(
                 &reads[backbone_idx].seq,
                 options,
             ) {
-                Some((start, end)) => group.push((read_idx, start, end)),
+                Some((start, end)) => {
+                    group.push((read_idx, start, end));
+                    placed[read_idx] = true;
+                }
                 None => rest.push(read_idx),
             }
         }
+        for &read in &touched {
+            shared[read as usize] = 0;
+        }
+        touched.clear();
         groups.push(group);
         remaining = rest;
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed pseudo-random sequence.
+    fn random_seq(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                b"ACGT"[(x >> 33) as usize % 4]
+            })
+            .collect()
+    }
+
+    /// `seq` with a substitution every `every` bases, from `offset`.
+    fn with_errors(seq: &[u8], every: usize, offset: usize) -> Vec<u8> {
+        let mut out = seq.to_vec();
+        for i in (offset..out.len()).step_by(every) {
+            out[i] = match out[i] {
+                b'A' => b'C',
+                b'C' => b'G',
+                b'G' => b'T',
+                _ => b'A',
+            };
+        }
+        out
+    }
+
+    /// Step 1 as it was before the k-mer index: every remaining read is tested.
+    fn group_by_structure_testing_every_read(
+        reads: &[Read],
+        read_maps: &[MinimizerMap],
+        options: &IsoformOptions,
+    ) -> Vec<Vec<PlacedRead>> {
+        let mut remaining: Vec<usize> = (0..reads.len()).collect();
+        remaining.sort_by_key(|&read_idx| Reverse(reads[read_idx].seq.len()));
+        let mut groups = Vec::new();
+        while !remaining.is_empty() {
+            let backbone_idx = remaining[0];
+            let mut group = vec![(backbone_idx, 0, reads[backbone_idx].seq.len() as i32)];
+            let mut rest = Vec::new();
+            for &read_idx in &remaining[1..] {
+                match fit::place_on_backbone(
+                    &read_maps[read_idx],
+                    &read_maps[backbone_idx],
+                    &reads[read_idx].seq,
+                    &reads[backbone_idx].seq,
+                    options,
+                ) {
+                    Some((start, end)) => group.push((read_idx, start, end)),
+                    None => rest.push(read_idx),
+                }
+            }
+            groups.push(group);
+            remaining = rest;
+        }
+        groups
+    }
+
+    #[test]
+    fn the_kmer_index_leaves_the_structure_groups_unchanged() {
+        // Gene A (3,000 bp) and an isoform that skips 150 bp; an unrelated gene B; truncated
+        // copies, 3' fragments and reads with errors of each: 90 reads, enough for the index.
+        let gene_a = random_seq(3000, 1);
+        let skip_a: Vec<u8> = gene_a[..1200].iter().chain(&gene_a[1350..]).copied().collect();
+        let gene_b = random_seq(1800, 2);
+        let mut seqs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..30 {
+            seqs.push(gene_a[i * 60..].to_vec());
+            seqs.push(with_errors(&skip_a[i * 40..], 37 + i, i));
+            seqs.push(gene_b[i * 30..].to_vec());
+        }
+        let reads: Vec<Read> = seqs
+            .into_iter()
+            .enumerate()
+            .map(|(i, seq)| Read { name: format!("r{i}"), seq })
+            .collect();
+        let options = IsoformOptions::default();
+        let maps = minimizer_maps(&reads, &options);
+        assert!(reads.len() >= INDEX_MIN_READS);
+        let indexed = group_by_structure(&reads, &maps, &options);
+        assert_eq!(indexed, group_by_structure_testing_every_read(&reads, &maps, &options));
+        assert!(indexed.len() >= 3, "gene A, its isoform and gene B: {}", indexed.len());
+    }
+
+    #[test]
+    fn a_long_gap_jump_rejects_without_aligning_what_the_alignment_rejects() {
+        // A read missing a 150 bp exon of its backbone: one gap with a 150 bp length difference.
+        let gene = random_seq(2000, 3);
+        let skipped: Vec<u8> = gene[..900].iter().chain(&gene[1050..]).copied().collect();
+        let mut options = IsoformOptions::default();
+        let map = |s: &[u8]| anchors::minimizer_map(s, options.minimizer_k, options.minimizer_w);
+        let (gene_map, skipped_map) = (map(&gene), map(&skipped));
+        let fits = |options: &IsoformOptions, read: &[u8], read_map: &MinimizerMap| {
+            fit::place_on_backbone(read_map, &gene_map, read, &gene, options).is_some()
+        };
+        assert!(!fits(&options, &skipped, &skipped_map), "the alignment rejects the skipped exon");
+        options.max_gap_jump = 20;
+        assert!(!fits(&options, &skipped, &skipped_map), "so does the length difference");
+        assert!(fits(&options, &gene, &gene_map), "the same structure still fits");
+    }
 }

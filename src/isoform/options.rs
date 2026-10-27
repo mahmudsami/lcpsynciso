@@ -77,6 +77,9 @@ pub struct IsoformOptions {
     pub min_gap_ident: f64,
     /// An indel of at least this many bp in an aligned gap is extra sequence, not error.
     pub max_indel_run: u32,
+    /// A gap whose read and backbone lengths differ by at least this many bp is rejected
+    /// without aligning it (0: always align). The difference forces that many indel bases.
+    pub max_gap_jump: u32,
     /// Unmatched flank (bp) that means a different structure: at one end if the sequences
     /// diverge there, at both ends if the read merely overhangs the backbone.
     pub max_flank: u32,
@@ -133,6 +136,7 @@ impl Default for IsoformOptions {
             max_gap: 40,
             min_gap_ident: 0.80,
             max_indel_run: 4,
+            max_gap_jump: 0,
             max_flank: 25,
             start_split: StartSplit::Auto,
             peak_width: 10,
@@ -167,6 +171,7 @@ pub(crate) fn apply_isoform_flag(
         "--max-gap" => options.max_gap = next().parse().unwrap(),
         "--min-gap-ident" => options.min_gap_ident = next().parse().unwrap(),
         "--max-indel-run" => options.max_indel_run = next().parse().unwrap(),
+        "--max-gap-jump" => options.max_gap_jump = next().parse().unwrap(),
         "--max-flank" => options.max_flank = next().parse().unwrap(),
         "--start-split" => {
             options.start_split = match next().as_str() {
@@ -249,6 +254,8 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
                             indel columns excluded
     --max-indel-run N       one indel of >= N bp in an aligned gap is    [4]
                             extra sequence, not error
+    --max-gap-jump N        reject a gap whose read and backbone lengths [0]
+                            differ by >= N bp without aligning it (0: off)
     --max-flank N           unmatched read end (bp) meaning a different  [25]
                             structure: one end if the sequences diverge there,
                             both ends if the read only overhangs the longest read
