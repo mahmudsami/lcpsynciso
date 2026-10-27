@@ -10,6 +10,8 @@
 //!   2. Split each group by where its reads start and end ([`ends`]).
 //!   3. Keep groups of at least `min_iso` reads and build each one's consensus ([`consensus`]).
 //!   4. Merge isoforms whose consensuses show they are the same transcript ([`collapse`]).
+//!   5. Validate each 3' end by its polyadenylation signal ([`end_validation`]): an end
+//!      without one merges into an isoform that contains it, or is written apart.
 //!
 //! Which test tells two isoforms apart:
 //!
@@ -31,6 +33,7 @@ mod align; // block-aligner calls: flank extension, global alignment, longest in
 mod anchors; // minimizer anchors and their collinear chain
 mod collapse; // step 4
 mod consensus; // step 3
+mod end_validation; // step 5
 mod ends; // step 2
 mod find_isoforms; // the `find-isoforms` subcommand
 mod fit; // step 1
@@ -40,7 +43,9 @@ pub(crate) mod stats; // diagnostic counters
 
 use anchors::MinimizerMap;
 pub use find_isoforms::{parse_args, run, print_usage, Config};
-pub use options::{AltStarts, CapSignal, EndMerge, IsoformOptions, StartLibrary, StartSplit};
+pub use options::{
+    AltStarts, CapSignal, EndMerge, EndValidation, IsoformOptions, StartLibrary, StartSplit,
+};
 pub(crate) use options::{apply_isoform_flag, ISOFORM_HELP};
 pub(crate) use output::{format_cluster_records, OutputFiles, ClusterRecords};
 
@@ -58,6 +63,9 @@ pub(crate) struct Isoform {
     /// Starts at a downstream transcription start that `--start-split auto` validated, so
     /// collapse must not fold it into a longer isoform that differs only at the 5' end.
     pub alt_start: bool,
+    /// Its 3' end carries a polyadenylation signal, or took one from an isoform that contains
+    /// it (step 5); otherwise it goes to the secondary output files.
+    pub end_validated: bool,
 }
 
 /// A read placed on its group's backbone: (read_idx, start, end), with start and end in
@@ -140,12 +148,13 @@ fn isoforms_from_groups(
                 &reads_by_group[group_index],
                 read_maps,
             );
-            Isoform { members, consensus, alt_start }
+            Isoform { members, consensus, alt_start, end_validated: true }
         })
         .collect();
     stats::add_elapsed(&stats::T_CONS, lap_start);
 
-    collapse::merge_duplicates(isoforms, reads, read_maps, options)
+    let merged = collapse::merge_duplicates(isoforms, reads, read_maps, options);
+    end_validation::validate_ends(merged, options)
 }
 
 /// Step 2 and the `min_iso` filter on the structure groups. Returns the drafts (isoforms that

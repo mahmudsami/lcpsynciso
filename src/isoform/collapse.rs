@@ -51,12 +51,7 @@ pub(super) fn merge_duplicates(
         .iter()
         .map(|isoform| minimizer_map(&isoform.consensus, options.minimizer_k, options.minimizer_w))
         .collect();
-    let strict = IsoformOptions {
-        min_cov: options.min_cov.max(0.95),
-        max_gap: options.collapse_gap,
-        max_indel_run: options.collapse_gap + 1,
-        ..options.clone()
-    };
+    let strict = strict_options(options);
 
     let n = isoforms.len();
     let mut merged_into: Vec<Option<usize>> = vec![None; n]; // merged isoform -> kept isoform
@@ -95,6 +90,7 @@ pub(super) fn merge_duplicates(
             members: std::mem::take(&mut isoforms[kept_idx].members),
             consensus: std::mem::take(&mut isoforms[kept_idx].consensus),
             alt_start: isoforms[kept_idx].alt_start,
+            end_validated: isoforms[kept_idx].end_validated,
         });
     }
     for i in 0..n {
@@ -111,6 +107,17 @@ pub(super) fn merge_duplicates(
         }
     }
     kept_isoforms
+}
+
+/// `options` tightened for comparing consensuses rather than reads: every gap longer than
+/// `collapse_gap` aligned, an indel run beyond it a difference, and 95% of the shorter covered.
+pub(super) fn strict_options(options: &IsoformOptions) -> IsoformOptions {
+    IsoformOptions {
+        min_cov: options.min_cov.max(0.95),
+        max_gap: options.collapse_gap,
+        max_indel_run: options.collapse_gap + 1,
+        ..options.clone()
+    }
 }
 
 /// How `small` relates to a larger isoform it may merge into.
@@ -267,11 +274,13 @@ mod tests {
                 members: (0..10).collect(),
                 consensus: truth[500..].to_vec(),
                 alt_start: false,
+                end_validated: true,
             },
             Isoform {
                 members: (10..13).collect(),
                 consensus: truth.clone(),
                 alt_start: false,
+                end_validated: true,
             },
         ];
         let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
@@ -300,11 +309,13 @@ mod tests {
                 members: (0..10).collect(),
                 consensus: truth[500..].to_vec(),
                 alt_start: true,
+                end_validated: true,
             },
             Isoform {
                 members: (10..13).collect(),
                 consensus: truth.clone(),
                 alt_start: false,
+                end_validated: true,
             },
         ];
         assert_eq!(merge_duplicates(isoforms, &reads, &read_maps, &options).len(), 2);
@@ -332,11 +343,13 @@ mod tests {
                 members: (0..10).collect(),
                 consensus: truth[..900].to_vec(),
                 alt_start: false,
+                end_validated: true,
             },
             Isoform {
                 members: (10..13).collect(),
                 consensus: truth.clone(),
                 alt_start: false,
+                end_validated: true,
             },
         ];
         let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
@@ -353,7 +366,7 @@ mod tests {
         for ((seq, &n), &a) in seqs.iter().zip(counts).zip(alt) {
             let first = all.len();
             all.extend((0..n).map(|_| seq.clone()));
-            isoforms.push(Isoform { members: (first..first + n).collect(), consensus: seq.clone(), alt_start: a });
+            isoforms.push(Isoform { members: (first..first + n).collect(), consensus: seq.clone(), alt_start: a, end_validated: true });
         }
         let reads: Vec<Read> = all.iter().enumerate()
             .map(|(i, seq)| Read { name: i.to_string(), seq: seq.clone() }).collect();

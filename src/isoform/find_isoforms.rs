@@ -209,7 +209,7 @@ pub fn run(config: Config) {
         for cid in cids {
             let reads = reads_by_cluster.remove(&cid).unwrap();
             let isoforms = detect_isoforms(&reads, &config.isoform_options);
-            total_isoforms += isoforms.len();
+            total_isoforms += isoforms.iter().filter(|isoform| isoform.end_validated).count();
             n_processed_clusters += 1;
             output_files.append(&format_cluster_records(cid, &reads, &isoforms));
         }

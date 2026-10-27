@@ -51,6 +51,7 @@ cluster identically by default (`--min-shared` 3, `--min-shared-frac` 0.1).
 | `isoform_assignments.tsv` | read_name, cluster_id, isoform_id (with a header row) |
 | `isoform_summary.tsv` | cluster_id, isoform_id, n_reads, length (with a header row) |
 | `isoforms.fasta` | consensus sequence per isoform |
+| `*.unvalidated_end.*` | the same three for isoforms whose 3' end has no polyadenylation signal and no isoform to merge into (step 5) |
 
 Not every read is assigned. A read is left out of `isoform_assignments.tsv` if its group
 has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluster is
@@ -113,6 +114,14 @@ order needs it, because the longest reads start clusters first.
    differ only at the 3' end merge when the smaller has at most `--collapse-ratio` of the
    larger's reads; with `--end-merge polya` they merge instead only if the longer isoform
    is A-rich just past the earlier end (internal priming), whatever the read counts.
+5. **Validate 3' ends** (`--end-validation pas`, the default). A real 3' end lies 10-30 nt
+   downstream of a polyadenylation signal (AAUAAA or one of 11 variants); an end made by
+   oligo-dT priming at an A-rich stretch inside the RNA has one only by chance. An isoform
+   whose consensus has no signal starting 10-34 bp before its end merges into the isoform
+   that contains it and runs on to the nearest validated end; if it starts at its own
+   validated start, it is kept, extended to that end. One that nothing contains is written
+   to the `*.unvalidated_end.*` files. Synthetic spike-ins (SIRV) mostly lack the signal:
+   use `--end-validation off` for them.
 
 ## Notes
 

@@ -55,6 +55,16 @@ pub enum EndMerge {
     Polya,
 }
 
+/// Whether an isoform's 3' end must carry a polyadenylation signal (`--end-validation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndValidation {
+    /// An end without one merges into an isoform that contains it, or goes to the secondary
+    /// output files.
+    Pas,
+    /// Every end is kept as it is.
+    Off,
+}
+
 /// Settings for [`super::detect_isoforms`], grouped by the step that reads them.
 #[derive(Clone)]
 pub struct IsoformOptions {
@@ -120,6 +130,9 @@ pub struct IsoformOptions {
     pub priming_window: usize,
     /// With `EndMerge::Polya`: A fraction of that window that means internal priming.
     pub priming_a_frac: f64,
+
+    // Step 5: 3' end validation (`end_validation.rs`).
+    pub end_validation: EndValidation,
 }
 
 impl Default for IsoformOptions {
@@ -148,6 +161,7 @@ impl Default for IsoformOptions {
             end_merge: EndMerge::Ratio,
             priming_window: 20,
             priming_a_frac: 0.6,
+            end_validation: EndValidation::Pas,
         }
     }
 }
@@ -231,6 +245,16 @@ pub(crate) fn apply_isoform_flag(
         }
         "--priming-window" => options.priming_window = next().parse().unwrap(),
         "--priming-a-frac" => options.priming_a_frac = next().parse().unwrap(),
+        "--end-validation" => {
+            options.end_validation = match next().as_str() {
+                "pas" => EndValidation::Pas,
+                "off" => EndValidation::Off,
+                other => {
+                    eprintln!("--end-validation takes pas or off, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
         _ => return false,
     }
     true
@@ -296,4 +320,13 @@ MERGING (near-identical isoforms, after consensus):
                             longer isoform is A-rich just past it (internal
                             priming), else keep both
     --priming-window N      bases past the earlier end tested (polya)    [20]
-    --priming-a-frac F      A fraction there meaning internal priming    [0.6]";
+    --priming-a-frac F      A fraction there meaning internal priming    [0.6]
+
+3' END VALIDATION (after merging):
+    --end-validation pas|off
+                            pas: a 3' end needs a polyadenylation signal [pas]
+                            (AAUAAA and 11 variants) starting 10-34 bp before
+                            it; an isoform without one merges into one that
+                            contains it and runs on to a validated end, or is
+                            written to the *.unvalidated_end.* files; off: keep
+                            every end";

@@ -42,6 +42,16 @@ pub(crate) static N_DROP: AtomicU64 = AtomicU64::new(0);
 /// Folded read was wider than the extent it was folded into (expected to stay zero).
 pub(crate) static N_ENCLOSED_WIDER: AtomicU64 = AtomicU64::new(0);
 
+// What `end_validation::validate_ends` did with each isoform's 3' end.
+/// The end carries a polyadenylation signal.
+pub(crate) static N_END_VALIDATED: AtomicU64 = AtomicU64::new(0);
+/// No signal: merged into an isoform that contains it and runs on to a validated end.
+pub(crate) static N_END_MERGED: AtomicU64 = AtomicU64::new(0);
+/// No signal, at its own validated start: kept, running on to the container's end.
+pub(crate) static N_END_RESPLIT: AtomicU64 = AtomicU64::new(0);
+/// No signal and nothing to merge into: written to the secondary output files.
+pub(crate) static N_END_SECONDARY: AtomicU64 = AtomicU64::new(0);
+
 /// Why `place_on_backbone` rejected a read, in report order.
 #[derive(Clone, Copy)]
 pub(crate) enum RejectReason {
@@ -133,6 +143,13 @@ pub(crate) fn print_report() {
         N_ENCLOSED.load(Relaxed),
         N_DROP.load(Relaxed),
         N_ENCLOSED_WIDER.load(Relaxed)
+    );
+    eprintln!(
+        "[predict] === 3' end validation: polyA signal={}  merged into a container={}  kept at its own start={}  secondary (no container)={} ===",
+        N_END_VALIDATED.load(Relaxed),
+        N_END_MERGED.load(Relaxed),
+        N_END_RESPLIT.load(Relaxed),
+        N_END_SECONDARY.load(Relaxed)
     );
     let rejections = load(&N_REJ);
     let total = rejections.iter().sum::<u64>().max(1);
