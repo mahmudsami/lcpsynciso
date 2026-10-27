@@ -13,6 +13,27 @@ pub enum StartSplit {
     Auto,
 }
 
+/// Whether reads in this library carry the untemplated 5' G of a capped end (`--cap-signal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapSignal {
+    /// Decided from the library: `predict` measures it over all structure groups first;
+    /// `find-isoforms`, which streams clusters, decides per structure group.
+    Auto,
+    On,
+    Off,
+}
+
+/// How start validation works in one library: whether the library shows the cap signal at
+/// all, the share of a start candidate's labelled reads that must carry the untemplated G (with
+/// a cap signal), and the share of the molecules reaching a candidate that must stop there
+/// (without one).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartLibrary {
+    pub cap_signal: bool,
+    pub threshold: f64,
+    pub stop_fraction: f64,
+}
+
 /// Whether merging may fold an isoform at a validated start into the one it lies inside
 /// (`--alt-starts`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +90,16 @@ pub struct IsoformOptions {
     /// How far (bp) a read end may sit from its peak, and the slack when folding a partial
     /// read into an isoform.
     pub boundary_tol: u32,
+    /// Whether the library shows the cap signal (`--cap-signal`).
+    pub cap_signal: CapSignal,
+    /// Share of a candidate's labelled reads that must be capped (`--cap-threshold`); None
+    /// sets it from the library.
+    pub cap_threshold: Option<f64>,
+    /// The stop fraction a start candidate needs without a cap signal (`--stop-threshold`);
+    /// None sets it from the library.
+    pub stop_threshold: Option<f64>,
+    /// The library's cap signal and thresholds, once known; None decides per structure group.
+    pub start_library: Option<StartLibrary>,
 
     // Step 3: isoforms.
     /// Minimum reads for an isoform, and for an end peak.
@@ -106,6 +137,10 @@ impl Default for IsoformOptions {
             start_split: StartSplit::Auto,
             peak_width: 10,
             boundary_tol: 150,
+            cap_signal: CapSignal::Auto,
+            cap_threshold: None,
+            stop_threshold: None,
+            start_library: None,
             min_iso: 3,
             collapse_gap: 3,
             collapse_ratio: 0.5,
@@ -148,6 +183,29 @@ pub(crate) fn apply_isoform_flag(
         "--no-split-starts" => options.start_split = StartSplit::Off,
         "--peak-width" => options.peak_width = next().parse().unwrap(),
         "--boundary-tol" => options.boundary_tol = next().parse().unwrap(),
+        "--cap-signal" => {
+            options.cap_signal = match next().as_str() {
+                "auto" => CapSignal::Auto,
+                "on" => CapSignal::On,
+                "off" => CapSignal::Off,
+                other => {
+                    eprintln!("--cap-signal takes auto, on or off, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--cap-threshold" => {
+            options.cap_threshold = match next().as_str() {
+                "auto" => None,
+                value => Some(value.parse().unwrap()),
+            }
+        }
+        "--stop-threshold" => {
+            options.stop_threshold = match next().as_str() {
+                "auto" => None,
+                value => Some(value.parse().unwrap()),
+            }
+        }
         "--min-iso" => options.min_iso = next().parse().unwrap(),
         "--collapse-gap" => options.collapse_gap = next().parse().unwrap(),
         "--collapse-ratio" => options.collapse_ratio = next().parse().unwrap(),
@@ -209,6 +267,21 @@ READ ENDS (a structure group splits into isoforms by where its reads start and e
                             can sit ~20 bp apart
     --boundary-tol N        max bp between a read end and its peak, and  [150]
                             the slack when folding partial reads into an isoform
+    --cap-signal auto|on|off
+                            whether reads carry the untemplated 5' G of  [auto]
+                            a capped end (template switching); auto: on if
+                            >= 20% of the reads that can show it do (predict
+                            measures this over the whole library)
+    --cap-threshold F|auto  share of a start peak's reads that must      [auto]
+                            carry the G for a real start; auto: the cut between
+                            the two modes of this share over the library's start
+                            peaks (Otsu)
+    --stop-threshold F|auto
+                            without a cap signal, the share of the       [auto]
+                            molecules reaching a start peak that must stop
+                            there (reads starting within 25 bp, against those
+                            plus the reads running past it); auto: the Otsu cut
+                            over the library's start peaks (predict)
 
 MERGING (near-identical isoforms, after consensus):
     --collapse-gap N        max gap or length difference (bp) to merge   [3]

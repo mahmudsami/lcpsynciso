@@ -26,7 +26,8 @@ use crate::cluster::{
     GreedyClusterer, SeedParams,
 };
 use crate::isoform::{
-    self, apply_isoform_flag, ClusterRecords, OutputFiles, Read, IsoformOptions, ISOFORM_HELP,
+    self, apply_isoform_flag, ClusterRecords, IsoformOptions, OutputFiles, PlacedRead, Read,
+    StartSplit, StartStats, ISOFORM_HELP,
 };
 use crate::read_store::ReadStore;
 
@@ -52,6 +53,8 @@ pub struct Config {
     pub max_cluster_size: usize,
     // Write each read's phase B cluster to `gene_clusters.tsv`.
     pub dump_clusters: bool,
+    // Write what start validation sees to this file (`--dump-starts`; diagnostics only).
+    pub dump_starts: Option<String>,
     // Isoform detection.
     pub isoform_options: IsoformOptions,
 }
@@ -77,6 +80,7 @@ impl Default for Config {
             min_cluster_size: 1,
             max_cluster_size: usize::MAX,
             dump_clusters: false,
+            dump_starts: None,
             isoform_options: IsoformOptions::default(),
         }
     }
@@ -117,6 +121,7 @@ pub fn parse_args(argv: &[String]) -> Config {
             "--iso-k" => config.isoform_options.minimizer_k = next().parse().unwrap(),
             "--iso-w" => config.isoform_options.minimizer_w = next().parse().unwrap(),
             "--dump-clusters" => config.dump_clusters = true,
+            "--dump-starts" => config.dump_starts = Some(next()),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -157,6 +162,8 @@ GENERAL:
     --batch N               reads per batch                              [500000]
     --max-reads N           stop after N reads                           [all]
     --dump-clusters         also write gene_clusters.tsv (phase B clusters)
+    --dump-starts FILE      write what start validation sees (start peaks, labelled
+                            and capped reads per structure group) to FILE
 
 CLUSTERING (seeds):
     --k N / --s N           k-mer / s-mer length                         [15 / 9]
@@ -249,6 +256,9 @@ pub fn run(config: Config) {
     }
 
     // ── Phase C: detect isoforms ──
+    if let Some(path) = &config.dump_starts {
+        isoform::stats::open_start_dump(path);
+    }
     let phase_c_start = Instant::now();
     let mut eligible_clusters: Vec<u32> = (0..n_clusters as u32)
         .filter(|&c| {
@@ -262,9 +272,75 @@ pub fn run(config: Config) {
         eligible_clusters.len()
     );
 
-    let writer = Mutex::new(OrderedWriter::new(OutputFiles::create(&config.out_dir)));
     let ns_unpack = AtomicU64::new(0);
     let ns_format = AtomicU64::new(0);
+
+    // With --start-split auto, the cap signal and the share of a start's reads that must carry
+    // it are properties of the library, so phase C runs in two passes. The first finds every
+    // cluster's structure groups and what start validation sees in them; the second detects
+    // the isoforms from the same groups with the library's decision.
+    let mut options = config.isoform_options.clone();
+    let groups_by_position: Option<Vec<Vec<Vec<PlacedRead>>>> =
+        (options.start_split == StartSplit::Auto).then(|| {
+            let pass: Vec<(Vec<Vec<PlacedRead>>, StartStats)> = eligible_clusters
+                .par_iter()
+                .with_max_len(1)
+                .map(|&cid| {
+                    let reads = unpack_reads(&cluster_members[cid as usize], &store, &ns_unpack);
+                    let groups = isoform::structure_groups(&reads, &options);
+                    let stats = isoform::start_stats(&reads, &groups, &options);
+                    (groups, stats)
+                })
+                .collect();
+            let mut library_stats = StartStats::default();
+            let mut groups_by_position = Vec::with_capacity(pass.len());
+            for (groups, stats) in pass {
+                library_stats.merge(stats);
+                groups_by_position.push(groups);
+            }
+            let library = library_stats.library(&options);
+            if library_stats.candidates.len() >= 100 {
+                let (z, auc) = library_stats.cap_sharpness_test(library.threshold);
+                eprintln!(
+                    "[predict] start validation: capped start candidates against the others, \
+                     sharpness AUC {auc:.3} (Mann-Whitney z {z:.1})"
+                );
+            }
+            let rule = if library.cap_signal {
+                format!(
+                    "on: a start needs {:.0}% of its labelled reads capped ({} start candidates)",
+                    100.0 * library.threshold,
+                    library_stats.candidates.len()
+                )
+            } else {
+                format!(
+                    "off: a start needs {:.0}% of the molecules reaching it to stop there \
+                     ({} start candidates)",
+                    100.0 * library.stop_fraction,
+                    library_stats.stop_fractions.len()
+                )
+            };
+            eprintln!(
+                "[predict] start validation: {} of {} labelled reads capped ({:.1}%) -> cap signal {}",
+                library_stats.capped,
+                library_stats.labelled,
+                100.0 * library_stats.capped as f64 / library_stats.labelled.max(1) as f64,
+                rule
+            );
+            isoform::stats::start_dump(format!(
+                "library\t{}\t{}\t{}\t{}\t{}\t{}",
+                library_stats.labelled,
+                library_stats.capped,
+                library.cap_signal as u8,
+                library.threshold,
+                library_stats.candidates.len(),
+                library.stop_fraction
+            ));
+            options.start_library = Some(library);
+            groups_by_position
+        });
+
+    let writer = Mutex::new(OrderedWriter::new(OutputFiles::create(&config.out_dir)));
     let finished = AtomicUsize::new(0);
     // Largest cluster first, each to whichever thread is free: `par_bridge` hands out one
     // cluster at a time, so the largest clusters spread over all threads. (An indexed
@@ -274,8 +350,9 @@ pub fn run(config: Config) {
         let (records, n_isoforms) = detect_and_format_isoforms(
             cid,
             &cluster_members[cid as usize],
+            groups_by_position.as_ref().map(|g| g[position].as_slice()),
             &store,
-            &config.isoform_options,
+            &options,
             &ns_unpack,
             &ns_format,
         );
@@ -286,6 +363,7 @@ pub fn run(config: Config) {
         }
     });
     let (total_isoforms, n_processed_clusters) = writer.into_inner().unwrap().finish();
+    isoform::stats::close_start_dump();
     let phase_c_time = phase_c_start.elapsed();
 
     // ── Report ──
@@ -364,16 +442,8 @@ impl OrderedWriter {
     }
 }
 
-/// Phase C for one cluster, on a worker thread: unpack its reads, detect its isoforms, and
-/// format its output records. Returns the records and the isoform count.
-fn detect_and_format_isoforms(
-    cid: u32,
-    member_indices: &[u32],
-    store: &ReadStore,
-    options: &IsoformOptions,
-    ns_unpack: &AtomicU64,
-    ns_format: &AtomicU64,
-) -> (ClusterRecords, usize) {
+/// One cluster's reads, unpacked from the store.
+fn unpack_reads(member_indices: &[u32], store: &ReadStore, ns_unpack: &AtomicU64) -> Vec<Read> {
     let lap_start = Instant::now();
     let reads: Vec<Read> = member_indices
         .iter()
@@ -383,8 +453,26 @@ fn detect_and_format_isoforms(
         })
         .collect();
     ns_unpack.fetch_add(lap_start.elapsed().as_nanos() as u64, Relaxed);
+    reads
+}
 
-    let isoforms = isoform::detect_isoforms(&reads, options);
+/// Phase C for one cluster, on a worker thread: unpack its reads, detect its isoforms (from
+/// `groups`, its structure groups, when the first pass found them), and format its output
+/// records. Returns the records and the isoform count.
+fn detect_and_format_isoforms(
+    cid: u32,
+    member_indices: &[u32],
+    groups: Option<&[Vec<PlacedRead>]>,
+    store: &ReadStore,
+    options: &IsoformOptions,
+    ns_unpack: &AtomicU64,
+    ns_format: &AtomicU64,
+) -> (ClusterRecords, usize) {
+    let reads = unpack_reads(member_indices, store, ns_unpack);
+    let isoforms = match groups {
+        Some(groups) => isoform::detect_isoforms_in_groups(&reads, groups, options),
+        None => isoform::detect_isoforms(&reads, options),
+    };
 
     let lap_start = Instant::now();
     let records = isoform::format_cluster_records(cid, &reads, &isoforms);

@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{stats, PlacedRead, Read, IsoformOptions, StartSplit};
+use super::{stats, CapSignal, IsoformOptions, PlacedRead, Read, StartLibrary, StartSplit};
 
 /// Start key of the reads at no validated start: the full-length isoform and its truncated
 /// copies.
@@ -31,19 +31,28 @@ const NO_START: i32 = i32::MIN;
 /// A read starting within this many bp of a validated start starts there. Real starts spread
 /// over ~20-50 bp, and this was the best peak window in calibration.
 const START_RADIUS: i32 = 25;
-/// Sharpness compares the starts within `START_RADIUS` with those within this many bp.
+/// Sharpness, which the cap consistency check compares between capped and uncapped
+/// candidates, sets the starts within `START_RADIUS` against those within this many bp.
 const SHARP_WINDOW: i32 = 300;
-/// Without a cap signal, a peak this sharp is a real start. SIRV: truncation peaks mostly
-/// below 0.3-0.5, real starts that --start-split off merged away at 0.95-1.00.
-const MIN_SHARPNESS: f64 = 0.45;
-/// With a cap signal, a peak whose reads carry an untemplated 5' G at least this often is a
-/// real start. UHRR HiFi: annotated starts ~97-100%, truncation peaks ~50%.
+/// Without a cap signal and without a cut from the library (`find-isoforms`, or too few start
+/// candidates), a candidate where at least this share of the molecules reaching it stop there
+/// is a real start. The library's Otsu cut over the stop fraction fell at 0.40-0.45 on UHRR
+/// (PacBio HiFi, ONT cDNA, ONT direct RNA) and SIRV (same three) start candidates.
+const MIN_STOP_FRACTION: f64 = 0.42;
+/// With a cap signal and no threshold from the library (`find-isoforms`, or too few start
+/// candidates), a peak whose reads carry an untemplated 5' G at least this often is a real start.
 const MIN_CAPPED: f64 = 0.7;
-/// A group shows the cap signal when at least this share of its informative reads carry an
-/// untemplated G, out of at least `MIN_CAP_READS`. Libraries without template switching
-/// (direct RNA, uncapped spike-ins) show almost none.
+/// A library (with `find-isoforms`, a structure group) shows the cap signal when at least
+/// this share of its labelled reads carry an untemplated G, out of at least `MIN_CAP_READS`.
+/// Capped share of labelled reads measured with --dump-starts: UHRR PacBio HiFi 41% and ONT
+/// cDNA 27% (template and strand switching), ONT direct RNA 12% and SIRV spike-ins 4% (none).
 const CAP_LIBRARY: f64 = 0.2;
 const MIN_CAP_READS: usize = 10;
+/// Outer windows (bp) recorded by --dump-starts, for choosing the sharpness window.
+const DUMP_WINDOWS: [i32; 9] = [50, 100, 150, 200, 300, 500, 750, 1000, 1500];
+/// Fewest start candidates with labelled reads for setting the library's threshold from
+/// their capped shares; with fewer, `MIN_CAPPED` is used.
+const MIN_LIBRARY_CANDIDATES: usize = 100;
 
 /// Read indices of each isoform found in `group`, and whether it starts at a validated
 /// downstream start, in no particular order. `group` sits on `reads[backbone_idx]`.
@@ -151,14 +160,27 @@ pub(super) fn split_by_ends(
         .collect()
 }
 
+/// The stop fraction of a start candidate at `peak`: of the molecules that reach it (reverse
+/// transcription runs from the 3' end towards the 5' end), the share that stop there, i.e. the
+/// reads starting within `START_RADIUS` of it against those reads plus the reads starting
+/// further upstream and running past it. At a reverse-transcription stop only a few percent of
+/// the molecules stop; at a real start the RNA itself ends, so only longer isoforms run past.
+fn stop_fraction(group: &[PlacedRead], peak: i32, starting: usize) -> f64 {
+    let passing = group
+        .iter()
+        .filter(|&&(_, start, end)| start < peak - START_RADIUS && end > peak + START_RADIUS)
+        .count();
+    starting as f64 / (starting + passing).max(1) as f64
+}
+
 /// Start peaks inside the backbone that look like real transcription starts rather than 5'
 /// truncation, ascending. The backbone reaches further 5', so each is a candidate alternative
 /// start of a longer transcript. A candidate needs `min_iso` reads within `START_RADIUS`, and
-///   * if the group shows a cap signal (template switching adds an untemplated G at a capped
-///     5' end), `MIN_CAPPED` of them carrying an untemplated G;
-///   * otherwise (direct RNA, uncapped spike-ins), a sharp peak: `MIN_SHARPNESS` of the starts
-///     within `SHARP_WINDOW`.
-/// Thresholds are from UHRR HiFi against GENCODE and SIRV spike-ins against their annotation.
+///   * if the library shows a cap signal (template switching adds an untemplated G at a capped
+///     5' end), the library's share of them carrying an untemplated G (`StartLibrary`);
+///   * otherwise (direct RNA, uncapped spike-ins), the library's share of the molecules reaching
+///     it that stop there (`stop_fraction`).
+/// Without a library decision (`find-isoforms`), the cap signal is decided per structure group.
 fn find_validated_starts(
     group: &[PlacedRead],
     reads: &[Read],
@@ -171,7 +193,10 @@ fn find_validated_starts(
             .into_iter()
             .filter(|&peak| peak > START_RADIUS)
             .collect();
-    if candidates.is_empty() {
+    // With --dump-starts every group is labelled, so the dump covers groups without a
+    // candidate too; the validated starts are the same.
+    let dump = stats::start_dump_on();
+    if candidates.is_empty() && !dump {
         return candidates;
     }
     let backbone_seq = &reads[backbone_idx].seq;
@@ -179,7 +204,11 @@ fn find_validated_starts(
         .iter()
         .map(|&(read_idx, start, _)| {
             if start > START_RADIUS {
-                has_untemplated_g(&reads[read_idx].seq, backbone_seq, start as usize)
+                let lead = untemplated_lead(&reads[read_idx].seq, backbone_seq, start as usize);
+                if let (true, Some((n, first))) = (dump, lead) {
+                    stats::record_lead(n, first);
+                }
+                lead.map(|(n, first)| n > 0 && first == b'G')
             } else {
                 None
             }
@@ -191,7 +220,23 @@ fn find_validated_starts(
             .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize))
     };
     let (known, with_g) = tally(&mut (0..group.len()));
-    let cap_signal = known >= MIN_CAP_READS && with_g as f64 >= CAP_LIBRARY * known as f64;
+    let (cap_signal, min_capped, min_stop) = match options.start_library {
+        Some(library) => (library.cap_signal, library.threshold, library.stop_fraction),
+        None => (
+            match options.cap_signal {
+                CapSignal::On => true,
+                CapSignal::Off => false,
+                CapSignal::Auto => {
+                    known >= MIN_CAP_READS && with_g as f64 >= CAP_LIBRARY * known as f64
+                }
+            },
+            options.cap_threshold.unwrap_or(MIN_CAPPED),
+            options.stop_threshold.unwrap_or(MIN_STOP_FRACTION),
+        ),
+    };
+    if dump {
+        stats::start_dump(format!("group\t{}\t{known}\t{with_g}\t{}", group.len(), cap_signal as u8));
+    }
 
     let mut validated = Vec::new();
     for peak in candidates {
@@ -201,16 +246,35 @@ fn find_validated_starts(
         if peak_reads.len() < options.min_iso {
             continue;
         }
+        let (n, g) = tally(&mut peak_reads.iter().copied());
+        let near = group
+            .iter()
+            .filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW)
+            .count();
         let real = if cap_signal {
-            let (n, g) = tally(&mut peak_reads.iter().copied());
-            n >= options.min_iso && g as f64 >= MIN_CAPPED * n as f64
+            n >= options.min_iso && g as f64 >= min_capped * n as f64
         } else {
-            let near = group
-                .iter()
-                .filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW)
-                .count();
-            peak_reads.len() as f64 >= MIN_SHARPNESS * near as f64
+            stop_fraction(group, peak, peak_reads.len()) >= min_stop
         };
+        if dump {
+            // Reads starting within each of several windows, for choosing the sharpness
+            // window; and the backbone, for placing the candidate on an annotation.
+            let windows: Vec<String> = DUMP_WINDOWS
+                .iter()
+                .map(|&w| {
+                    let c = group.iter().filter(|&&(_, start, _)| (start - peak).abs() <= w).count();
+                    format!("{w}:{c}")
+                })
+                .collect();
+            stats::start_dump(format!(
+                "cand\t{peak}\t{}\t{n}\t{g}\t{near}\t{}\t{}\t{}\t{}",
+                peak_reads.len(),
+                real as u8,
+                cap_signal as u8,
+                reads[backbone_idx].name,
+                windows.join(",")
+            ));
+        }
         if real {
             validated.push(peak);
         }
@@ -218,12 +282,187 @@ fn find_validated_starts(
     validated
 }
 
-/// Whether `read_seq`, whose first matched base sits at backbone position `start`, begins
-/// with an untemplated G: 1-3 leading bases, the first a G, that the backbone doesn't have
-/// there. None if the read's start doesn't match the backbone exactly nearby (sequencing
-/// errors), so the read tells nothing. A G that the transcript itself has just before the
-/// start is indistinguishable and counts as templated.
-fn has_untemplated_g(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Option<bool> {
+/// What start validation sees across a library: its labelled reads (start more than
+/// `START_RADIUS` into the backbone, with an exact match there), how many of them carry an
+/// untemplated G, the capped share and sharpness of every start candidate with `min_iso`
+/// labelled reads, and the stop fraction of every start candidate.
+#[derive(Default)]
+pub(crate) struct StartStats {
+    pub labelled: u64,
+    pub capped: u64,
+    /// (capped share, sharpness) of the candidates with `min_iso` labelled reads.
+    pub candidates: Vec<(f32, f32)>,
+    pub stop_fractions: Vec<f32>,
+}
+
+impl StartStats {
+    pub(crate) fn merge(&mut self, other: StartStats) {
+        self.labelled += other.labelled;
+        self.capped += other.capped;
+        self.candidates.extend(other.candidates);
+        self.stop_fractions.extend(other.stop_fractions);
+    }
+
+    /// The library's cap signal and thresholds, unless set on the command line. The cap signal
+    /// is on when at least `CAP_LIBRARY` of the labelled reads are capped, and, with at least
+    /// `MIN_LIBRARY_CANDIDATES` labelled candidates, the candidates above the cap threshold are
+    /// sharper than those below it (one-sided Mann-Whitney, p < 0.001): a cap marks real
+    /// starts, which form tight piles. In ONT PCR-cDNA, untemplated-looking Gs left by primer
+    /// trimming pass the share but not this test. The cap threshold is
+    /// the cut between the two modes of the candidates' capped shares, truncation peaks near
+    /// none and real starts near all (Otsu); the stop-fraction threshold is the Otsu cut over
+    /// the candidates' stop fractions, reverse-transcription stops (a few percent of the
+    /// molecules) against real starts. With fewer than `MIN_LIBRARY_CANDIDATES` candidates,
+    /// `MIN_CAPPED` and `MIN_STOP_FRACTION`.
+    pub(crate) fn library(&self, options: &IsoformOptions) -> StartLibrary {
+        let threshold = options.cap_threshold.unwrap_or_else(|| {
+            if self.candidates.len() >= MIN_LIBRARY_CANDIDATES {
+                let shares: Vec<f32> = self.candidates.iter().map(|&(share, _)| share).collect();
+                otsu_threshold(&shares)
+            } else {
+                MIN_CAPPED
+            }
+        });
+        let cap_signal = match options.cap_signal {
+            CapSignal::On => true,
+            CapSignal::Off => false,
+            CapSignal::Auto => {
+                self.labelled >= MIN_CAP_READS as u64
+                    && self.capped as f64 >= CAP_LIBRARY * self.labelled as f64
+                    && (self.candidates.len() < MIN_LIBRARY_CANDIDATES
+                        || self.capped_starts_are_sharper(threshold))
+            }
+        };
+        let stop_fraction = options.stop_threshold.unwrap_or_else(|| {
+            if self.stop_fractions.len() >= MIN_LIBRARY_CANDIDATES {
+                otsu_threshold(&self.stop_fractions)
+            } else {
+                MIN_STOP_FRACTION
+            }
+        });
+        StartLibrary { cap_signal, threshold, stop_fraction }
+    }
+
+    /// Whether the candidates with at least `threshold` capped reads are sharper than the
+    /// others: one-sided Mann-Whitney U test, normal approximation, z > 3.09 (p < 0.001).
+    pub(crate) fn capped_starts_are_sharper(&self, threshold: f64) -> bool {
+        let (z, _) = self.cap_sharpness_test(threshold);
+        z > 3.09
+    }
+
+    /// The Mann-Whitney z and AUC of sharpness, capped candidates against uncapped ones.
+    pub(crate) fn cap_sharpness_test(&self, threshold: f64) -> (f64, f64) {
+        let mut ranked: Vec<(f32, bool)> = self
+            .candidates
+            .iter()
+            .map(|&(share, sharp)| (sharp, share as f64 >= threshold))
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (n1, n2) = ranked.iter().fold((0f64, 0f64), |(a, b), &(_, c)| {
+            if c {
+                (a + 1.0, b)
+            } else {
+                (a, b + 1.0)
+            }
+        });
+        if n1 == 0.0 || n2 == 0.0 {
+            return (0.0, 0.5);
+        }
+        // Sum of the capped candidates' ranks, ties sharing their mean rank.
+        let mut rank_sum = 0f64;
+        let mut i = 0;
+        while i < ranked.len() {
+            let mut j = i;
+            while j < ranked.len() && ranked[j].0 == ranked[i].0 {
+                j += 1;
+            }
+            let mean_rank = (i + 1 + j) as f64 / 2.0;
+            rank_sum += mean_rank * ranked[i..j].iter().filter(|&&(_, c)| c).count() as f64;
+            i = j;
+        }
+        let u = rank_sum - n1 * (n1 + 1.0) / 2.0;
+        let z = (u - n1 * n2 / 2.0) / (n1 * n2 * (n1 + n2 + 1.0) / 12.0).sqrt();
+        (z, u / (n1 * n2))
+    }
+}
+
+/// Add what start validation sees in `group`, sitting on `reads[backbone_idx]`, to `acc`.
+pub(super) fn add_start_stats(
+    group: &[PlacedRead],
+    reads: &[Read],
+    backbone_idx: usize,
+    options: &IsoformOptions,
+    acc: &mut StartStats,
+) {
+    let width = options.peak_width.max(1) as i32;
+    let backbone_seq = &reads[backbone_idx].seq;
+    let capped: Vec<Option<bool>> = group
+        .iter()
+        .map(|&(read_idx, start, _)| {
+            (start > START_RADIUS)
+                .then(|| untemplated_lead(&reads[read_idx].seq, backbone_seq, start as usize))
+                .flatten()
+                .map(|(n, first)| n > 0 && first == b'G')
+        })
+        .collect();
+    acc.labelled += capped.iter().flatten().count() as u64;
+    acc.capped += capped.iter().flatten().filter(|&&c| c).count() as u64;
+    let peaks = find_peaks(group.iter().map(|&(_, start, _)| start), width, options.min_iso);
+    for peak in peaks.into_iter().filter(|&peak| peak > START_RADIUS) {
+        let near: Vec<usize> = (0..group.len())
+            .filter(|&group_pos| (group[group_pos].1 - peak).abs() <= START_RADIUS)
+            .collect();
+        let (n, g) = near
+            .iter()
+            .filter_map(|&group_pos| capped[group_pos])
+            .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize));
+        let around =
+            group.iter().filter(|&&(_, start, _)| (start - peak).abs() <= SHARP_WINDOW).count();
+        let sharpness = near.len() as f32 / around as f32;
+        if n >= options.min_iso {
+            acc.candidates.push((g as f32 / n as f32, sharpness));
+        }
+        acc.stop_fractions.push(stop_fraction(group, peak, near.len()) as f32);
+    }
+}
+
+/// Otsu's threshold for values in [0, 1]: over 100 bins, the cut that maximises the variance
+/// between the values below and above it.
+fn otsu_threshold(values: &[f32]) -> f64 {
+    const BINS: usize = 100;
+    let mut hist = [0u64; BINS];
+    for &v in values {
+        hist[((v as f64 * BINS as f64) as usize).min(BINS - 1)] += 1;
+    }
+    let mid = |bin: usize| (bin as f64 + 0.5) / BINS as f64;
+    let n: u64 = hist.iter().sum();
+    let total: f64 = hist.iter().enumerate().map(|(bin, &c)| mid(bin) * c as f64).sum();
+    let (mut below, mut below_sum) = (0u64, 0f64);
+    let (mut best, mut cut) = (-1f64, MIN_CAPPED);
+    for t in 1..BINS {
+        below += hist[t - 1];
+        below_sum += mid(t - 1) * hist[t - 1] as f64;
+        let above = n - below;
+        if below == 0 || above == 0 {
+            continue;
+        }
+        let gap = below_sum / below as f64 - (total - below_sum) / above as f64;
+        let between = below as f64 * above as f64 * gap * gap;
+        if between > best {
+            best = between;
+            cut = t as f64 / BINS as f64;
+        }
+    }
+    cut
+}
+
+/// How `read_seq`, whose first matched base sits at backbone position `start`, begins: the
+/// number of leading bases (0-3) before it matches the backbone exactly for 12 bases there
+/// (within 1 bp), and its first base. An untemplated G is 1-3 leading bases, the first a G,
+/// that the backbone doesn't have there. None if the read's start doesn't match the backbone
+/// exactly nearby (sequencing errors), so the read tells nothing. A G that the transcript
+/// itself has just before the start is indistinguishable and counts as templated.
+fn untemplated_lead(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Option<(usize, u8)> {
     const L: usize = 12;
     for lead in 0..=3usize {
         for b in [start, start.saturating_sub(1), start + 1] {
@@ -231,7 +470,7 @@ fn has_untemplated_g(read_seq: &[u8], backbone_seq: &[u8], start: usize) -> Opti
                 && lead + L <= read_seq.len()
                 && read_seq[lead..lead + L] == backbone_seq[b..b + L]
             {
-                return Some(lead > 0 && read_seq[0] == b'G');
+                return Some((lead, read_seq[0]));
             }
         }
     }
@@ -360,6 +599,16 @@ mod tests {
     }
 
     #[test]
+    fn the_stop_fraction_sets_the_pile_against_the_reads_running_past_it() {
+        // 6 reads start at 800; 2 start upstream and run past, 1 starts upstream and ends
+        // before it, 1 starts within the pile's window: 7 of 9 molecules stop there.
+        let mut group: Vec<PlacedRead> = (0..6).map(|i| (i, 800, 2000)).collect();
+        group.extend([(6, 0, 2000), (7, 300, 2000), (8, 100, 700), (9, 790, 2000)]);
+        let f = stop_fraction(&group, 800, 7);
+        assert!((f - 7.0 / 9.0).abs() < 1e-9, "{f}");
+    }
+
+    #[test]
     fn auto_without_a_cap_signal_keeps_a_sharp_peak_and_folds_a_smeared_one() {
         assert!(alt_start_group(false, false, false).iter().any(|i| i.1));
         assert!(alt_start_group(false, false, true).iter().all(|i| !i.1));
@@ -387,6 +636,49 @@ mod tests {
     fn without_start_split_full_length_reads_join_their_isoform() {
         let options = IsoformOptions { start_split: StartSplit::Off, ..IsoformOptions::default() };
         assert_eq!(sizes(&truncated_majority(), &options), vec![11]);
+    }
+
+    #[test]
+    fn otsu_cuts_between_two_modes() {
+        let mut values: Vec<f32> = (0..300).map(|i| (i % 10) as f32 / 100.0).collect();
+        values.extend((0..100).map(|i| 0.75 + (i % 20) as f32 / 100.0));
+        let cut = otsu_threshold(&values);
+        assert!(cut > 0.09 && cut <= 0.75, "{cut}");
+    }
+
+    #[test]
+    fn the_library_decides_the_cap_signal_and_threshold() {
+        // capped candidates (share 0.9) are sharp, uncapped ones (0.05) diffuse
+        let mut candidates: Vec<(f32, f32)> = (0..150).map(|i| (0.05, (i % 30) as f32 / 100.0)).collect();
+        candidates.extend((0..50).map(|i| (0.9, 0.5 + (i % 40) as f32 / 100.0)));
+        let stats = StartStats { labelled: 1000, capped: 400, candidates, stop_fractions: Vec::new() };
+        let auto = IsoformOptions::default();
+        assert!(stats.library(&auto).cap_signal);
+        // the same Gs on candidates no sharper than the rest: not a cap signal (ONT PCR-cDNA)
+        let mut mixed: Vec<(f32, f32)> = (0..150).map(|i| (0.05, (i % 50) as f32 / 100.0)).collect();
+        mixed.extend((0..50).map(|i| (0.9, (i % 50) as f32 / 100.0)));
+        let primer = StartStats { labelled: 1000, capped: 400, candidates: mixed, stop_fractions: Vec::new() };
+        assert!(!primer.library(&auto).cap_signal);
+        let few = StartStats { labelled: 1000, capped: 100, ..StartStats::default() };
+        assert!(!few.library(&auto).cap_signal);
+        assert_eq!(few.library(&auto).threshold, MIN_CAPPED);
+        assert_eq!(few.library(&auto).stop_fraction, MIN_STOP_FRACTION);
+        let set = IsoformOptions {
+            cap_signal: CapSignal::On,
+            cap_threshold: Some(0.5),
+            stop_threshold: Some(0.3),
+            ..auto
+        };
+        assert_eq!(
+            few.library(&set),
+            StartLibrary { cap_signal: true, threshold: 0.5, stop_fraction: 0.3 }
+        );
+        // without a cap signal, the stop-fraction threshold comes from the candidates
+        let mut stops: Vec<f32> = (0..300).map(|i| (i % 20) as f32 / 100.0).collect();
+        stops.extend((0..100).map(|i| 0.8 + (i % 20) as f32 / 100.0));
+        let uncapped = StartStats { labelled: 1000, capped: 50, stop_fractions: stops, ..StartStats::default() };
+        let cut = uncapped.library(&auto).stop_fraction;
+        assert!((0.19..=0.8).contains(&cut), "{cut}");
     }
 
     #[test]

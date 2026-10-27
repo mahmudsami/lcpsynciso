@@ -3,7 +3,10 @@
 //! Counters are process-wide and summed over all worker threads, so times are CPU time in
 //! nanoseconds, not wall time.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 // Time spent in each step of `detect_isoforms`.
@@ -145,4 +148,57 @@ pub(crate) fn print_report() {
             .collect::<Vec<_>>()
             .join("  ")
     );
+}
+
+// ── `--dump-starts`: what start validation sees (`ends::find_validated_starts`) ──────────
+//
+// Off unless `open_start_dump` was called; the isoforms are the same either way. Lines:
+//   group  n_reads  labelled  capped  cap_signal
+//   cand   peak  reads_25bp  labelled  capped  reads_300bp  validated  cap_signal  backbone
+//          reads per window (bp:count, ...)
+//   library  labelled  capped  cap_signal  threshold  candidates   (predict, before phase C)
+//   lead   n_leading_bases  first_base  reads        (summary, written by `close_start_dump`)
+
+static START_DUMP: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
+/// Labelled reads by number of leading bases (0-3) and the first of them (A, C, G, T, other).
+static H_LEAD: [[AtomicU64; 5]; 4] = [const { [const { AtomicU64::new(0) }; 5] }; 4];
+
+pub(crate) fn open_start_dump(path: &str) {
+    let mut w = BufWriter::new(File::create(path).expect("cannot create --dump-starts file"));
+    writeln!(w, "# lcpsynciso --dump-starts: group / cand / lead lines, see stats.rs").unwrap();
+    START_DUMP.set(Mutex::new(w)).ok();
+}
+
+pub(crate) fn start_dump_on() -> bool {
+    START_DUMP.get().is_some()
+}
+
+pub(crate) fn start_dump(line: String) {
+    if let Some(w) = START_DUMP.get() {
+        writeln!(w.lock().unwrap(), "{line}").unwrap();
+    }
+}
+
+pub(crate) fn record_lead(lead: usize, first_base: u8) {
+    let b = match first_base {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 4,
+    };
+    H_LEAD[lead.min(3)][b].fetch_add(1, Relaxed);
+}
+
+pub(crate) fn close_start_dump() {
+    if let Some(w) = START_DUMP.get() {
+        let mut w = w.lock().unwrap();
+        for (lead, row) in H_LEAD.iter().enumerate() {
+            for (b, c) in row.iter().enumerate() {
+                writeln!(w, "lead\t{lead}\t{}\t{}", "ACGTN".as_bytes()[b] as char, c.load(Relaxed))
+                    .unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
 }
