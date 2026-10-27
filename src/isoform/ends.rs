@@ -31,12 +31,14 @@ const NO_START: i32 = i32::MIN;
 /// A read starting within this many bp of a validated start starts there. Real starts spread
 /// over ~20-50 bp, and this was the best peak window in calibration.
 const START_RADIUS: i32 = 25;
-/// Sharpness compares the starts within `START_RADIUS` with those within this many bp.
+/// Sharpness, which the cap consistency check compares between capped and uncapped
+/// candidates, sets the starts within `START_RADIUS` against those within this many bp.
 const SHARP_WINDOW: i32 = 300;
-/// Without a cap signal and without a threshold from the library (`find-isoforms`, or too few
-/// start candidates), a peak this sharp is a real start. The library's Otsu cut fell at
-/// 0.41-0.49 on SIRV (HiFi, ONT cDNA, ONT direct RNA) and UHRR (same three) start peaks.
-const MIN_SHARPNESS: f64 = 0.45;
+/// Without a cap signal and without a cut from the library (`find-isoforms`, or too few start
+/// candidates), a candidate where at least this share of the molecules reaching it stop there
+/// is a real start. The library's Otsu cut over the stop fraction fell at 0.40-0.45 on UHRR
+/// (PacBio HiFi, ONT cDNA, ONT direct RNA) and SIRV (same three) start candidates.
+const MIN_STOP_FRACTION: f64 = 0.42;
 /// With a cap signal and no threshold from the library (`find-isoforms`, or too few start
 /// candidates), a peak whose reads carry an untemplated 5' G at least this often is a real start.
 const MIN_CAPPED: f64 = 0.7;
@@ -158,13 +160,26 @@ pub(super) fn split_by_ends(
         .collect()
 }
 
+/// The stop fraction of a start candidate at `peak`: of the molecules that reach it (reverse
+/// transcription runs from the 3' end towards the 5' end), the share that stop there, i.e. the
+/// reads starting within `START_RADIUS` of it against those reads plus the reads starting
+/// further upstream and running past it. At a reverse-transcription stop only a few percent of
+/// the molecules stop; at a real start the RNA itself ends, so only longer isoforms run past.
+fn stop_fraction(group: &[PlacedRead], peak: i32, starting: usize) -> f64 {
+    let passing = group
+        .iter()
+        .filter(|&&(_, start, end)| start < peak - START_RADIUS && end > peak + START_RADIUS)
+        .count();
+    starting as f64 / (starting + passing).max(1) as f64
+}
+
 /// Start peaks inside the backbone that look like real transcription starts rather than 5'
 /// truncation, ascending. The backbone reaches further 5', so each is a candidate alternative
 /// start of a longer transcript. A candidate needs `min_iso` reads within `START_RADIUS`, and
 ///   * if the library shows a cap signal (template switching adds an untemplated G at a capped
 ///     5' end), the library's share of them carrying an untemplated G (`StartLibrary`);
-///   * otherwise (direct RNA, uncapped spike-ins), a sharp peak: `MIN_SHARPNESS` of the starts
-///     within `SHARP_WINDOW`.
+///   * otherwise (direct RNA, uncapped spike-ins), the library's share of the molecules reaching
+///     it that stop there (`stop_fraction`).
 /// Without a library decision (`find-isoforms`), the cap signal is decided per structure group.
 fn find_validated_starts(
     group: &[PlacedRead],
@@ -205,8 +220,8 @@ fn find_validated_starts(
             .fold((0usize, 0usize), |(n, g), c| (n + 1, g + c as usize))
     };
     let (known, with_g) = tally(&mut (0..group.len()));
-    let (cap_signal, min_capped, min_sharpness) = match options.start_library {
-        Some(library) => (library.cap_signal, library.threshold, library.sharpness),
+    let (cap_signal, min_capped, min_stop) = match options.start_library {
+        Some(library) => (library.cap_signal, library.threshold, library.stop_fraction),
         None => (
             match options.cap_signal {
                 CapSignal::On => true,
@@ -216,7 +231,7 @@ fn find_validated_starts(
                 }
             },
             options.cap_threshold.unwrap_or(MIN_CAPPED),
-            options.sharp_threshold.unwrap_or(MIN_SHARPNESS),
+            options.stop_threshold.unwrap_or(MIN_STOP_FRACTION),
         ),
     };
     if dump {
@@ -239,7 +254,7 @@ fn find_validated_starts(
         let real = if cap_signal {
             n >= options.min_iso && g as f64 >= min_capped * n as f64
         } else {
-            peak_reads.len() as f64 >= min_sharpness * near as f64
+            stop_fraction(group, peak, peak_reads.len()) >= min_stop
         };
         if dump {
             // Reads starting within each of several windows, for choosing the sharpness
@@ -270,14 +285,14 @@ fn find_validated_starts(
 /// What start validation sees across a library: its labelled reads (start more than
 /// `START_RADIUS` into the backbone, with an exact match there), how many of them carry an
 /// untemplated G, the capped share and sharpness of every start candidate with `min_iso`
-/// labelled reads, and the sharpness of every start candidate.
+/// labelled reads, and the stop fraction of every start candidate.
 #[derive(Default)]
 pub(crate) struct StartStats {
     pub labelled: u64,
     pub capped: u64,
     /// (capped share, sharpness) of the candidates with `min_iso` labelled reads.
     pub candidates: Vec<(f32, f32)>,
-    pub sharpness: Vec<f32>,
+    pub stop_fractions: Vec<f32>,
 }
 
 impl StartStats {
@@ -285,7 +300,7 @@ impl StartStats {
         self.labelled += other.labelled;
         self.capped += other.capped;
         self.candidates.extend(other.candidates);
-        self.sharpness.extend(other.sharpness);
+        self.stop_fractions.extend(other.stop_fractions);
     }
 
     /// The library's cap signal and thresholds, unless set on the command line. The cap signal
@@ -295,9 +310,10 @@ impl StartStats {
     /// starts, which form tight piles. In ONT PCR-cDNA, untemplated-looking Gs left by primer
     /// trimming pass the share but not this test. The cap threshold is
     /// the cut between the two modes of the candidates' capped shares, truncation peaks near
-    /// none and real starts near all (Otsu); the sharpness threshold is the Otsu cut over the
-    /// candidates' sharpness, diffuse truncation against tight starts. With fewer than
-    /// `MIN_LIBRARY_CANDIDATES` candidates, `MIN_CAPPED` and `MIN_SHARPNESS`.
+    /// none and real starts near all (Otsu); the stop-fraction threshold is the Otsu cut over
+    /// the candidates' stop fractions, reverse-transcription stops (a few percent of the
+    /// molecules) against real starts. With fewer than `MIN_LIBRARY_CANDIDATES` candidates,
+    /// `MIN_CAPPED` and `MIN_STOP_FRACTION`.
     pub(crate) fn library(&self, options: &IsoformOptions) -> StartLibrary {
         let threshold = options.cap_threshold.unwrap_or_else(|| {
             if self.candidates.len() >= MIN_LIBRARY_CANDIDATES {
@@ -317,14 +333,14 @@ impl StartStats {
                         || self.capped_starts_are_sharper(threshold))
             }
         };
-        let sharpness = options.sharp_threshold.unwrap_or_else(|| {
-            if self.sharpness.len() >= MIN_LIBRARY_CANDIDATES {
-                otsu_threshold(&self.sharpness)
+        let stop_fraction = options.stop_threshold.unwrap_or_else(|| {
+            if self.stop_fractions.len() >= MIN_LIBRARY_CANDIDATES {
+                otsu_threshold(&self.stop_fractions)
             } else {
-                MIN_SHARPNESS
+                MIN_STOP_FRACTION
             }
         });
-        StartLibrary { cap_signal, threshold, sharpness }
+        StartLibrary { cap_signal, threshold, stop_fraction }
     }
 
     /// Whether the candidates with at least `threshold` capped reads are sharper than the
@@ -406,7 +422,7 @@ pub(super) fn add_start_stats(
         if n >= options.min_iso {
             acc.candidates.push((g as f32 / n as f32, sharpness));
         }
-        acc.sharpness.push(sharpness);
+        acc.stop_fractions.push(stop_fraction(group, peak, near.len()) as f32);
     }
 }
 
@@ -583,6 +599,16 @@ mod tests {
     }
 
     #[test]
+    fn the_stop_fraction_sets_the_pile_against_the_reads_running_past_it() {
+        // 6 reads start at 800; 2 start upstream and run past, 1 starts upstream and ends
+        // before it, 1 starts within the pile's window: 7 of 9 molecules stop there.
+        let mut group: Vec<PlacedRead> = (0..6).map(|i| (i, 800, 2000)).collect();
+        group.extend([(6, 0, 2000), (7, 300, 2000), (8, 100, 700), (9, 790, 2000)]);
+        let f = stop_fraction(&group, 800, 7);
+        assert!((f - 7.0 / 9.0).abs() < 1e-9, "{f}");
+    }
+
+    #[test]
     fn auto_without_a_cap_signal_keeps_a_sharp_peak_and_folds_a_smeared_one() {
         assert!(alt_start_group(false, false, false).iter().any(|i| i.1));
         assert!(alt_start_group(false, false, true).iter().all(|i| !i.1));
@@ -625,33 +651,33 @@ mod tests {
         // capped candidates (share 0.9) are sharp, uncapped ones (0.05) diffuse
         let mut candidates: Vec<(f32, f32)> = (0..150).map(|i| (0.05, (i % 30) as f32 / 100.0)).collect();
         candidates.extend((0..50).map(|i| (0.9, 0.5 + (i % 40) as f32 / 100.0)));
-        let stats = StartStats { labelled: 1000, capped: 400, candidates, sharpness: Vec::new() };
+        let stats = StartStats { labelled: 1000, capped: 400, candidates, stop_fractions: Vec::new() };
         let auto = IsoformOptions::default();
         assert!(stats.library(&auto).cap_signal);
         // the same Gs on candidates no sharper than the rest: not a cap signal (ONT PCR-cDNA)
         let mut mixed: Vec<(f32, f32)> = (0..150).map(|i| (0.05, (i % 50) as f32 / 100.0)).collect();
         mixed.extend((0..50).map(|i| (0.9, (i % 50) as f32 / 100.0)));
-        let primer = StartStats { labelled: 1000, capped: 400, candidates: mixed, sharpness: Vec::new() };
+        let primer = StartStats { labelled: 1000, capped: 400, candidates: mixed, stop_fractions: Vec::new() };
         assert!(!primer.library(&auto).cap_signal);
         let few = StartStats { labelled: 1000, capped: 100, ..StartStats::default() };
         assert!(!few.library(&auto).cap_signal);
         assert_eq!(few.library(&auto).threshold, MIN_CAPPED);
-        assert_eq!(few.library(&auto).sharpness, MIN_SHARPNESS);
+        assert_eq!(few.library(&auto).stop_fraction, MIN_STOP_FRACTION);
         let set = IsoformOptions {
             cap_signal: CapSignal::On,
             cap_threshold: Some(0.5),
-            sharp_threshold: Some(0.3),
+            stop_threshold: Some(0.3),
             ..auto
         };
         assert_eq!(
             few.library(&set),
-            StartLibrary { cap_signal: true, threshold: 0.5, sharpness: 0.3 }
+            StartLibrary { cap_signal: true, threshold: 0.5, stop_fraction: 0.3 }
         );
-        // without a cap signal, the sharpness threshold comes from the candidates
-        let mut sharp: Vec<f32> = (0..300).map(|i| (i % 20) as f32 / 100.0).collect();
-        sharp.extend((0..100).map(|i| 0.8 + (i % 20) as f32 / 100.0));
-        let uncapped = StartStats { labelled: 1000, capped: 50, sharpness: sharp, ..StartStats::default() };
-        let cut = uncapped.library(&auto).sharpness;
+        // without a cap signal, the stop-fraction threshold comes from the candidates
+        let mut stops: Vec<f32> = (0..300).map(|i| (i % 20) as f32 / 100.0).collect();
+        stops.extend((0..100).map(|i| 0.8 + (i % 20) as f32 / 100.0));
+        let uncapped = StartStats { labelled: 1000, capped: 50, stop_fractions: stops, ..StartStats::default() };
+        let cut = uncapped.library(&auto).stop_fraction;
         assert!((0.19..=0.8).contains(&cut), "{cut}");
     }
 

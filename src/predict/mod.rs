@@ -314,10 +314,10 @@ pub fn run(config: Config) {
                 )
             } else {
                 format!(
-                    "off: a start needs {:.0}% of the reads starting within 300 bp to start within \
-                     25 bp of it ({} start candidates)",
-                    100.0 * library.sharpness,
-                    library_stats.sharpness.len()
+                    "off: a start needs {:.0}% of the molecules reaching it to stop there \
+                     ({} start candidates)",
+                    100.0 * library.stop_fraction,
+                    library_stats.stop_fractions.len()
                 )
             };
             eprintln!(
@@ -334,7 +334,7 @@ pub fn run(config: Config) {
                 library.cap_signal as u8,
                 library.threshold,
                 library_stats.candidates.len(),
-                library.sharpness
+                library.stop_fraction
             ));
             options.start_library = Some(library);
             groups_by_position
