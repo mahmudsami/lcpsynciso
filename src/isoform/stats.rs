@@ -49,6 +49,16 @@ pub(crate) static N_DROP: AtomicU64 = AtomicU64::new(0);
 /// Folded read was wider than the extent it was folded into (expected to stay zero).
 pub(crate) static N_ENCLOSED_WIDER: AtomicU64 = AtomicU64::new(0);
 
+// How `consensus::build_consensus` set the ends (reported as "consensus ends").
+/// Consensuses built from voted windows.
+pub(crate) static N_CONSENSUS: AtomicU64 = AtomicU64::new(0);
+/// Consensuses whose leading untemplated Gs were trimmed.
+pub(crate) static N_CAP_G_TRIMMED: AtomicU64 = AtomicU64::new(0);
+/// Consensuses whose 3' end came from the read vote, and those where it differs from the
+/// longest read's.
+pub(crate) static N_TAIL_VOTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static N_TAIL_CHANGED: AtomicU64 = AtomicU64::new(0);
+
 /// Why `place_on_backbone` rejected a read, in report order.
 #[derive(Clone, Copy)]
 pub(crate) enum RejectReason {
@@ -153,6 +163,13 @@ pub(crate) fn print_report() {
     eprintln!(
         "[predict] === step 1: gaps rejected for their length difference={} ===",
         N_GAP_JUMPS.load(Relaxed)
+    );
+    eprintln!(
+        "[predict] === consensus ends: built={}  leading Gs trimmed={}  tails voted={}  tails differing from the longest read's={} ===",
+        N_CONSENSUS.load(Relaxed),
+        N_CAP_G_TRIMMED.load(Relaxed),
+        N_TAIL_VOTED.load(Relaxed),
+        N_TAIL_CHANGED.load(Relaxed)
     );
     eprintln!(
         "[predict] === aligned gaps by length difference (bp): {} ===",

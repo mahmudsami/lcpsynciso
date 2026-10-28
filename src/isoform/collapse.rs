@@ -103,11 +103,19 @@ pub(super) fn merge_duplicates(
             kept_isoforms[pos[&j]].members.extend(extra);
         }
     }
+    // A rebuild keeps the longest read's 3' end: it may be the real end that most of the
+    // merged reads stop short of.
+    let ends = consensus::ConsensusEnds { vote_tail: false, ..options.consensus_ends() };
     for (p, &kept_idx) in kept.iter().enumerate() {
         if rebuild[kept_idx] {
             let isoform = &mut kept_isoforms[p];
-            isoform.consensus =
-                consensus::build_consensus(reads, &isoform.members, &isoform.members, read_maps);
+            isoform.consensus = consensus::build_consensus(
+                reads,
+                &isoform.members,
+                &isoform.members,
+                read_maps,
+                ends,
+            );
         }
     }
     kept_isoforms

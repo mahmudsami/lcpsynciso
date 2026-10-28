@@ -1,6 +1,8 @@
 //! Isoform-detection settings: [`IsoformOptions`], its defaults, and the command-line flags and
 //! help text that `predict` and `find-isoforms` share.
 
+use super::consensus::ConsensusEnds;
+
 /// How read starts split a structure group (`--start-split`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartSplit {
@@ -106,9 +108,15 @@ pub struct IsoformOptions {
     /// The library's cap signal and thresholds, once known; None decides per structure group.
     pub start_library: Option<StartLibrary>,
 
-    // Step 3: isoforms.
+    // Step 3: isoforms and their consensus. (`consensus.rs`)
     /// Minimum reads for an isoform, and for an end peak.
     pub min_iso: usize,
+    /// Trim from a consensus the leading Gs that template switching added in front of a capped
+    /// start, in a library with the cap signal (`--cap-g`).
+    pub trim_cap_g: bool,
+    /// Take a consensus's 3' end from the most frequent read tail rather than from the longest
+    /// read (`--consensus-tail`).
+    pub vote_tail: bool,
 
     // Step 4: merge duplicates. (`collapse.rs`)
     /// Largest gap, indel or length difference (bp) between two isoforms that still merge.
@@ -148,6 +156,8 @@ impl Default for IsoformOptions {
             stop_threshold: None,
             start_library: None,
             min_iso: 3,
+            trim_cap_g: true,
+            vote_tail: true,
             collapse_gap: 3,
             collapse_ratio: 0.5,
             collapse_ident: 0.98,
@@ -156,6 +166,19 @@ impl Default for IsoformOptions {
             priming_window: 20,
             priming_a_frac: 0.6,
         }
+    }
+}
+
+impl IsoformOptions {
+    /// How a consensus treats its ends. Leading Gs are trimmed only where the library is known
+    /// to show the cap signal: `predict` decides it before step 2, `find-isoforms` only with
+    /// `--cap-signal on`.
+    pub(crate) fn consensus_ends(&self) -> ConsensusEnds {
+        let cap_signal = match self.start_library {
+            Some(library) => library.cap_signal,
+            None => self.cap_signal == CapSignal::On,
+        };
+        ConsensusEnds { trim_cap_g: self.trim_cap_g && cap_signal, vote_tail: self.vote_tail }
     }
 }
 
@@ -214,6 +237,26 @@ pub(crate) fn apply_isoform_flag(
             }
         }
         "--min-iso" => options.min_iso = next().parse().unwrap(),
+        "--cap-g" => {
+            options.trim_cap_g = match next().as_str() {
+                "trim" => true,
+                "keep" => false,
+                other => {
+                    eprintln!("--cap-g takes trim or keep, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--consensus-tail" => {
+            options.vote_tail = match next().as_str() {
+                "vote" => true,
+                "backbone" => false,
+                other => {
+                    eprintln!("--consensus-tail takes vote or backbone, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
         "--collapse-gap" => options.collapse_gap = next().parse().unwrap(),
         "--collapse-ratio" => options.collapse_ratio = next().parse().unwrap(),
         "--collapse-ident" => options.collapse_ident = next().parse().unwrap(),
@@ -291,6 +334,16 @@ READ ENDS (a structure group splits into isoforms by where its reads start and e
                             there (reads starting within 25 bp, against those
                             plus the reads running past it); auto: the Otsu cut
                             over the library's start peaks (predict)
+
+CONSENSUS (per isoform: the longest read, corrected window by window by the reads):
+    --cap-g trim|keep       leading Gs that template switching added in  [trim]
+                            front of a capped start: trim them while more
+                            reads start at the G than carry one more G before
+                            it (only with a cap signal); keep = the longest read's
+    --consensus-tail vote|backbone
+                            3' end: vote = the most frequent read tail   [vote]
+                            from the last window boundary most reads hold;
+                            backbone = the longest read's
 
 MERGING (near-identical isoforms, after consensus):
     --collapse-gap N        max gap or length difference (bp) to merge   [3]

@@ -131,6 +131,7 @@ fn isoforms_from_groups(
     stats::add_elapsed(&stats::T_PARTITION, lap_start);
 
     let lap_start = Instant::now();
+    let ends = options.consensus_ends();
     let isoforms: Vec<Isoform> = drafts
         .into_iter()
         .map(|(members, alt_start, group_index)| {
@@ -139,6 +140,7 @@ fn isoforms_from_groups(
                 &members,
                 &reads_by_group[group_index],
                 read_maps,
+                ends,
             );
             Isoform { members, consensus, alt_start }
         })
