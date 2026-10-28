@@ -58,6 +58,8 @@ pub(crate) static N_CAP_G_TRIMMED: AtomicU64 = AtomicU64::new(0);
 /// longest read's.
 pub(crate) static N_TAIL_VOTED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static N_TAIL_CHANGED: AtomicU64 = AtomicU64::new(0);
+/// Isoforms reported as start variants of another (`--start-variants report`).
+pub(crate) static N_START_VARIANTS: AtomicU64 = AtomicU64::new(0);
 
 /// Why `place_on_backbone` rejected a read, in report order.
 #[derive(Clone, Copy)]
@@ -170,6 +172,10 @@ pub(crate) fn print_report() {
         N_CAP_G_TRIMMED.load(Relaxed),
         N_TAIL_VOTED.load(Relaxed),
         N_TAIL_CHANGED.load(Relaxed)
+    );
+    eprintln!(
+        "[predict] === merging: start variants reported apart from the isoforms={} ===",
+        N_START_VARIANTS.load(Relaxed)
     );
     eprintln!(
         "[predict] === aligned gaps by length difference (bp): {} ===",

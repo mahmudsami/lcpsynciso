@@ -11,7 +11,7 @@ use std::fs;
 use crate::seqio::SeqReader;
 
 use super::options::{apply_isoform_flag, ISOFORM_HELP};
-use super::output::{format_cluster_records, OutputFiles};
+use super::output::{count_isoforms, format_cluster_records, OutputFiles};
 use super::{detect_isoforms, IsoformOptions, Read};
 
 pub struct Config {
@@ -209,7 +209,7 @@ pub fn run(config: Config) {
         for cid in cids {
             let reads = reads_by_cluster.remove(&cid).unwrap();
             let isoforms = detect_isoforms(&reads, &config.isoform_options);
-            total_isoforms += isoforms.len();
+            total_isoforms += count_isoforms(&isoforms);
             n_processed_clusters += 1;
             output_files.append(&format_cluster_records(cid, &reads, &isoforms));
         }

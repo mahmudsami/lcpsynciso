@@ -134,6 +134,11 @@ pub struct IsoformOptions {
     pub priming_window: usize,
     /// With `EndMerge::Polya`: A fraction of that window that means internal priming.
     pub priming_a_frac: f64,
+    /// Report an isoform kept apart that has another's structure and 3' end and a start at
+    /// most `start_variant_window` bp away (one promoter) as a start variant of it, apart from
+    /// the isoforms (`--start-variants`).
+    pub start_variants: bool,
+    pub start_variant_window: u32,
 }
 
 impl Default for IsoformOptions {
@@ -165,6 +170,8 @@ impl Default for IsoformOptions {
             end_merge: EndMerge::Ratio,
             priming_window: 20,
             priming_a_frac: 0.6,
+            start_variants: true,
+            start_variant_window: 50,
         }
     }
 }
@@ -282,6 +289,17 @@ pub(crate) fn apply_isoform_flag(
         }
         "--priming-window" => options.priming_window = next().parse().unwrap(),
         "--priming-a-frac" => options.priming_a_frac = next().parse().unwrap(),
+        "--start-variants" => {
+            options.start_variants = match next().as_str() {
+                "report" => true,
+                "keep" => false,
+                other => {
+                    eprintln!("--start-variants takes report or keep, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--start-variant-window" => options.start_variant_window = next().parse().unwrap(),
         _ => return false,
     }
     true
@@ -360,4 +378,14 @@ MERGING (near-identical isoforms, after consensus):
                             longer isoform is A-rich just past it (internal
                             priming), else keep both
     --priming-window N      bases past the earlier end tested (polya)    [20]
-    --priming-a-frac F      A fraction there meaning internal priming    [0.6]";
+    --priming-a-frac F      A fraction there meaning internal priming    [0.6]
+    --start-variants report|keep
+                            isoforms kept apart that share structure     [report]
+                            and 3' end peak and start within
+                            --start-variant-window bp (one promoter): report =
+                            the smaller is a start variant of the larger, written
+                            to start_variants.fasta, its reads counted for the
+                            larger; keep = both stay isoforms
+    --start-variant-window N
+                            max bp between the starts of a start variant [50]
+                            and its isoform";

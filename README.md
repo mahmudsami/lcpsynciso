@@ -51,6 +51,11 @@ cluster identically by default (`--min-shared` 3, `--min-shared-frac` 0.1).
 | `isoform_assignments.tsv` | read_name, cluster_id, isoform_id (with a header row) |
 | `isoform_summary.tsv` | cluster_id, isoform_id, n_reads, length (with a header row) |
 | `isoforms.fasta` | consensus sequence per isoform |
+| `start_variants.fasta` | consensus per start variant: an isoform's other start in the same promoter (header: `variant_of=`, `start_offset=`) |
+| `start_variant_assignments.tsv` | read_name, cluster_id, variant_id, isoform_id (with a header row) |
+
+A start variant's reads count for its isoform in the first three files, so they describe the
+isoforms alone. `--start-variants keep` reports start variants as isoforms instead.
 
 Not every read is assigned. A read is left out of `isoform_assignments.tsv` if its group
 has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluster is
@@ -119,7 +124,10 @@ order needs it, because the longest reads start clusters first.
    (`--alt-starts keep`, the default; `merge` lets it merge like any other). Isoforms that
    differ only at the 3' end merge when the smaller has at most `--collapse-ratio` of the
    larger's reads; with `--end-merge polya` they merge instead only if the longer isoform
-   is A-rich just past the earlier end (internal priming), whatever the read counts.
+   is A-rich just past the earlier end (internal priming), whatever the read counts. Two
+   isoforms kept apart that share the structure and 3' end peak, with starts at most
+   `--start-variant-window` bp apart (50; one promoter), are one isoform and a start variant
+   of it: the one with fewer reads is reported in `start_variants.fasta`.
 
 ## Notes
 

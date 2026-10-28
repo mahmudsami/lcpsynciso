@@ -477,5 +477,5 @@ fn detect_and_format_isoforms(
     let lap_start = Instant::now();
     let records = isoform::format_cluster_records(cid, &reads, &isoforms);
     ns_format.fetch_add(lap_start.elapsed().as_nanos() as u64, Relaxed);
-    (records, isoforms.len())
+    (records, isoform::count_isoforms(&isoforms))
 }
