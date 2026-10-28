@@ -82,77 +82,6 @@ pub(super) fn shared_anchors(read_map: &MinimizerMap, backbone_map: &MinimizerMa
     anchors
 }
 
-/// The minimizers of every read of one cluster, by k-mer: for each distinct k-mer, the reads
-/// that have it and how often. For a backbone it gives every read's number of
-/// [`shared_anchors`] at once, touching only the reads that share a k-mer with it, so step 1
-/// need not compare the backbone with each read to find the few it can fit.
-pub(super) struct KmerIndex {
-    /// Distinct k-mers, sorted.
-    kmers: Vec<u64>,
-    /// `postings[starts[i]..starts[i + 1]]` hold the reads of `kmers[i]`.
-    starts: Vec<u32>,
-    /// (read, occurrences of the k-mer in the read).
-    postings: Vec<(u32, u32)>,
-}
-
-impl KmerIndex {
-    pub(super) fn new(maps: &[MinimizerMap]) -> Self {
-        let mut all: Vec<(u64, u32, u32)> = Vec::new();
-        for (read, map) in maps.iter().enumerate() {
-            for (kmer, positions) in map.runs() {
-                all.push((kmer, read as u32, positions.len() as u32));
-            }
-        }
-        all.sort_unstable();
-        let mut index = KmerIndex {
-            kmers: Vec::new(),
-            starts: Vec::new(),
-            postings: Vec::with_capacity(all.len()),
-        };
-        for (kmer, read, count) in all {
-            if index.kmers.last() != Some(&kmer) {
-                index.kmers.push(kmer);
-                index.starts.push(index.postings.len() as u32);
-            }
-            index.postings.push((read, count));
-        }
-        index.starts.push(index.postings.len() as u32);
-        index
-    }
-
-    /// Add to `shared[read]` the number of anchors each read shares with `backbone`, the
-    /// length of `shared_anchors(read, backbone)`: for each k-mer, its occurrences in the read
-    /// times those in the backbone. Reads with `skip[read]` set are left out. Each read raised
-    /// from zero is pushed onto `touched`, so the caller can reset just those.
-    pub(super) fn count_shared(
-        &self,
-        backbone: &MinimizerMap,
-        skip: &[bool],
-        shared: &mut [u32],
-        touched: &mut Vec<u32>,
-    ) {
-        let mut from = 0;
-        for (kmer, positions) in backbone.runs() {
-            // The backbone's k-mers come in order, so each search starts where the last ended.
-            from += self.kmers[from..].partition_point(|&k| k < kmer);
-            if self.kmers.get(from) != Some(&kmer) {
-                continue;
-            }
-            let (lo, hi) = (self.starts[from] as usize, self.starts[from + 1] as usize);
-            for &(read, count) in &self.postings[lo..hi] {
-                if skip[read as usize] {
-                    continue;
-                }
-                let s = &mut shared[read as usize];
-                if *s == 0 {
-                    touched.push(read);
-                }
-                *s = s.saturating_add(count.saturating_mul(positions.len() as u32));
-            }
-        }
-    }
-}
-
 /// Packed k-mer (two bits per base) and start position of every k-mer; k-mers containing a
 /// non-ACGT base are skipped.
 fn encode_kmers(seq: &[u8], k: usize) -> Vec<(u64, u32)> {
@@ -341,47 +270,6 @@ mod tests {
             read_map.runs().map(|(kmer, positions)| (kmer, positions.len())).collect::<Vec<_>>(),
             vec![(1, 2), (7, 1), (9, 1)]
         );
-    }
-
-    /// A fixed pseudo-random sequence over `alphabet`.
-    fn random_seq(n: usize, seed: u64, alphabet: &[u8]) -> Vec<u8> {
-        let mut x = seed;
-        (0..n)
-            .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                alphabet[(x >> 33) as usize % alphabet.len()]
-            })
-            .collect()
-    }
-
-    #[test]
-    fn kmer_index_counts_each_reads_shared_anchors() {
-        // Low-complexity sequences, so k-mers repeat within and across them.
-        let seqs: Vec<Vec<u8>> = (0..12)
-            .map(|i| {
-                let alphabet: &[u8] = if i % 3 == 0 { b"ACGT" } else { b"AC" };
-                random_seq(300 + 40 * i, i as u64 + 1, alphabet)
-            })
-            .collect();
-        let maps: Vec<MinimizerMap> = seqs.iter().map(|s| minimizer_map(s, 8, 5)).collect();
-        let index = KmerIndex::new(&maps);
-        for (b, backbone) in maps.iter().enumerate() {
-            let mut skip = vec![false; maps.len()];
-            skip[b] = true;
-            let mut shared = vec![0u32; maps.len()];
-            let mut touched = Vec::new();
-            index.count_shared(backbone, &skip, &mut shared, &mut touched);
-            for (r, read) in maps.iter().enumerate().filter(|&(r, _)| r != b) {
-                let expected = shared_anchors(read, backbone).len();
-                assert_eq!(shared[r] as usize, expected, "read {r}, backbone {b}");
-            }
-            assert_eq!(shared[b], 0);
-            let mut t = touched.clone();
-            t.sort_unstable();
-            t.dedup();
-            assert_eq!(t.len(), touched.len(), "each read is touched once");
-            assert!(touched.iter().all(|&r| shared[r as usize] > 0));
-        }
     }
 
     #[test]

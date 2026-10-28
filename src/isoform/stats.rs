@@ -26,9 +26,6 @@ pub(crate) static N_GAPS_ALIGNED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static N_TRACE: AtomicU64 = AtomicU64::new(0);
 /// Aligned interior gaps accepted as sequencing error.
 pub(crate) static N_GAPS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
-/// Tests skipped because the k-mer index showed the read shares too few anchors with the
-/// backbone (`group_by_structure`); each would have been a few-anchors rejection.
-pub(crate) static N_NO_SHARED_ANCHORS: AtomicU64 = AtomicU64::new(0);
 /// Gaps rejected for the difference of their two lengths, without aligning (`--max-gap-jump`).
 pub(crate) static N_GAP_JUMPS: AtomicU64 = AtomicU64::new(0);
 /// Aligned gaps by the difference of their read and backbone lengths ([`JUMP_BUCKETS`]), as
@@ -154,8 +151,7 @@ pub(crate) fn print_report() {
         N_ENCLOSED_WIDER.load(Relaxed)
     );
     eprintln!(
-        "[predict] === step 1: tests skipped by the k-mer index (too few shared anchors)={}  gaps rejected for their length difference={} ===",
-        N_NO_SHARED_ANCHORS.load(Relaxed),
+        "[predict] === step 1: gaps rejected for their length difference={} ===",
         N_GAP_JUMPS.load(Relaxed)
     );
     eprintln!(
