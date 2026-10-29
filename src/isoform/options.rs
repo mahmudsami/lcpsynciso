@@ -162,7 +162,7 @@ impl Default for IsoformOptions {
             start_library: None,
             min_iso: 3,
             trim_cap_g: true,
-            vote_tail: true,
+            vote_tail: false,
             collapse_gap: 3,
             collapse_ratio: 0.5,
             collapse_ident: 0.98,
@@ -358,10 +358,11 @@ CONSENSUS (per isoform: the longest read, corrected window by window by the read
                             front of a capped start: trim them while more
                             reads start at the G than carry one more G before
                             it (only with a cap signal); keep = the longest read's
-    --consensus-tail vote|backbone
-                            3' end: vote = the most frequent read tail   [vote]
-                            from the last window boundary most reads hold;
-                            backbone = the longest read's
+    --consensus-tail backbone|vote
+                            3' end: backbone = the longest read's;   [backbone]
+                            vote = the most frequent read tail from the
+                            last window boundary most reads hold (more
+                            exact 3' ends, fewer full-length recoveries)
 
 MERGING (near-identical isoforms, after consensus):
     --collapse-gap N        max gap or length difference (bp) to merge   [3]

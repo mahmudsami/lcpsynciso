@@ -115,8 +115,10 @@ order needs it, because the longest reads start clusters first.
    needed. The 5' end is the longest read's; in a library with a cap signal, its leading Gs
    are trimmed while more reads start at the G than carry one more G before it, since
    template switching adds one untemplated G at most capped ends (`--cap-g`). The 3' end is
-   the most frequent read tail from the last window boundary most reads hold, not the longest
-   read's, which tends to end past the most common end (`--consensus-tail`).
+   the longest read's. `--consensus-tail vote` takes instead the most frequent read tail from
+   the last window boundary most reads hold: on UHRR HiFi it ends exactly at the annotated end
+   more often (67% vs 56% of full-length matches), but recovers about 1% fewer transcripts
+   full-length and 4% fewer at 99.9% coverage.
 4. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
    the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
    past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
