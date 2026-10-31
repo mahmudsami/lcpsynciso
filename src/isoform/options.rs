@@ -148,7 +148,7 @@ impl Default for IsoformOptions {
             minimizer_w: 10,
             min_anchors: 3,
             min_cov: 0.80,
-            max_gap: 40,
+            max_gap: 10,
             min_gap_ident: 0.80,
             max_indel_run: 4,
             max_gap_jump: 64,
@@ -311,7 +311,7 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
     --min-iso N             min reads for a reported isoform             [3]
     --min-anchors N         min collinear anchors to trust an alignment  [3]
     --min-cov F             read fraction its alignment must cover       [0.80]
-    --max-gap N             gap between anchors (bp) above which it is   [40]
+    --max-gap N             gap between anchors (bp) above which it is   [10]
                             aligned; shorter ones count as sequencing error
     --min-gap-ident F       min identity Eq/(Eq+X) of an aligned gap,    [0.80]
                             indel columns excluded
