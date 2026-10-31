@@ -154,6 +154,13 @@ fn interior_gaps_match(
         if gap_len <= options.max_gap as usize {
             continue;
         }
+        // The two sides' lengths differ by `jump`, so any alignment has that many indel bases.
+        let jump = (read_gap_end.saturating_sub(read_gap_start))
+            .abs_diff(backbone_gap_end.saturating_sub(backbone_gap_start));
+        if options.max_gap_jump > 0 && jump >= options.max_gap_jump as usize {
+            stats::inc(&stats::N_GAP_JUMPS);
+            return false; // extra sequence, without aligning
+        }
         stats::inc(&stats::N_GAPS_ALIGNED);
         stats::record_gap_size(gap_len);
         stats::inc(&stats::N_TRACE);
@@ -161,6 +168,9 @@ fn interior_gaps_match(
             &read_seq[read_gap_start..read_gap_end.max(read_gap_start)],
             &backbone_seq[backbone_gap_start..backbone_gap_end.max(backbone_gap_start)],
         );
+        let accepted = gap_stats.ident() >= options.min_gap_ident
+            && gap_stats.longest_indel < options.max_indel_run as usize;
+        stats::record_gap_jump(jump, accepted);
         if gap_stats.ident() < options.min_gap_ident {
             return false; // different sequence
         }

@@ -28,6 +28,13 @@
 //! no boundaries at all and was copied verbatim from the backbone, errors included. On UHRR
 //! HiFi that was the main reason an isoform's coding sequence carried a 1-bp frameshift.
 //!
+//! The ends lie outside every window. The 5' end before the first boundary is the backbone's;
+//! with [`ConsensusEnds::trim_cap_g`], minus the Gs that template switching added in front of a
+//! capped start ([`untemplated_gs`]). The 3' end is the backbone's after the last boundary, or,
+//! with [`ConsensusEnds::vote_tail`], the most frequent read tail from the last boundary most
+//! members hold: read ends spread over a few bases around the isoform's end peak, and the
+//! backbone, the longest read, tends to end past the most common one.
+//!
 //! Because the flanking k-mers are exact matches in every contributing read, the
 //! segments are perfectly registered and concatenate seamlessly — no inner
 //! alignment at all. Cost is ~O(total read length): one minimizer merge per read
@@ -45,7 +52,17 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::anchors::{chain_anchors, shared_anchors, Anchor, MinimizerMap};
-use super::Read;
+use super::{stats, Read};
+
+/// How a consensus treats its ends, which lie outside every voted window.
+#[derive(Clone, Copy, Default)]
+pub struct ConsensusEnds {
+    /// Trim the leading Gs that template switching added in front of a capped start. Only for
+    /// libraries that show the cap signal.
+    pub trim_cap_g: bool,
+    /// Take the 3' end from the most frequent read tail instead of the backbone.
+    pub vote_tail: bool,
+}
 
 /// Fewest reads that must carry a backbone minimizer for it to bound a window. Two reads
 /// can only tie, which keeps the backbone, so a stretch covered by the backbone alone or by
@@ -77,6 +94,7 @@ pub fn build_consensus(
     members: &[usize],
     group_reads: &[usize],
     read_maps: &[MinimizerMap],
+    ends: ConsensusEnds,
 ) -> Vec<u8> {
     // Backbone = longest member.
     let backbone_idx = *members.iter().max_by_key(|&&read_idx| reads[read_idx].seq.len()).unwrap();
@@ -189,16 +207,95 @@ pub fn build_consensus(
         }
     }
 
-    // Assemble: unanchored leading end, modal windows, unanchored trailing end.
     let boundary_pos = |bi: usize| candidates[boundaries[bi]] as usize;
+    stats::inc(&stats::N_CONSENSUS);
+
+    // The 5' end: the backbone's, minus the Gs template switching added in front of it.
+    let head_start = if ends.trim_cap_g {
+        let heads: Vec<&[u8]> = hits
+            .iter()
+            .zip(members)
+            .filter_map(|(h, &read_idx)| {
+                read_pos_at(h, boundaries[0]).map(|p| &reads[read_idx].seq[..p as usize])
+            })
+            .collect();
+        untemplated_gs(&backbone_seq[..boundary_pos(0)], &heads)
+    } else {
+        0
+    };
+    if head_start > 0 {
+        stats::inc(&stats::N_CAP_G_TRIMMED);
+    }
+
+    // The 3' end: the most frequent tail of the members from the last boundary that more than
+    // half of them hold, if at least two agree; otherwise the backbone's after the last boundary.
+    let mut tail: Option<(usize, Vec<u8>)> = None;
+    if ends.vote_tail {
+        let held = (0..n_boundaries)
+            .rev()
+            .find(|&bi| 2 * support[boundaries[bi]] as usize > members.len());
+        if let Some(bi) = held {
+            let mut tails: HashMap<Vec<u8>, u32> = HashMap::new();
+            for (h, &read_idx) in hits.iter().zip(members) {
+                if let Some(p) = read_pos_at(h, boundaries[bi]) {
+                    *tails.entry(reads[read_idx].seq[p as usize..].to_vec()).or_insert(0) += 1;
+                }
+            }
+            if tails.values().any(|&c| c >= 2) {
+                let backbone_tail = &backbone_seq[boundary_pos(bi)..];
+                let voted = modal_segment(&tails, backbone_tail);
+                stats::inc(&stats::N_TAIL_VOTED);
+                if voted != backbone_tail {
+                    stats::inc(&stats::N_TAIL_CHANGED);
+                }
+                tail = Some((bi, voted));
+            }
+        }
+    }
+    let (last_bi, tail) = tail.unwrap_or_else(|| {
+        (n_boundaries - 1, backbone_seq[boundary_pos(n_boundaries - 1)..].to_vec())
+    });
+
+    // Assemble: leading end, modal windows, trailing end.
     let mut out: Vec<u8> = Vec::with_capacity(backbone_seq.len());
-    out.extend_from_slice(&backbone_seq[..boundary_pos(0)]);
-    for wi in 0..n_windows {
+    out.extend_from_slice(&backbone_seq[head_start..boundary_pos(0)]);
+    for wi in 0..last_bi {
         let default = &backbone_seq[boundary_pos(wi)..boundary_pos(wi + 1)];
         out.extend_from_slice(&modal_segment(&votes[wi], default));
     }
-    out.extend_from_slice(&backbone_seq[boundary_pos(n_boundaries - 1)..]);
+    out.extend_from_slice(&tail);
     out
+}
+
+/// How many leading bases of `head`, the consensus before its first boundary, are Gs that
+/// template switching added in front of a capped start rather than bases of the transcript.
+/// `heads` holds the same stretch of each member read that reaches the boundary. Reverse
+/// transcription adds one untemplated G at most capped ends, sometimes two or three, and none at
+/// the others. So at an added G, more reads start there than carry one more G in front of it;
+/// at the transcript's first base, the capped reads, which carry one G in front of it, outnumber
+/// those starting there. A leading G is trimmed while more reads start at it than carry one more
+/// G before it, at most three. A transcript that starts with G keeps it if most of its reads at
+/// that start are capped.
+fn untemplated_gs(head: &[u8], heads: &[&[u8]]) -> usize {
+    let mut trim = 0;
+    while trim < 3 && trim < head.len() && head[trim] == b'G' {
+        let rest = &head[trim..];
+        let here = heads.iter().filter(|&&h| h == rest).count();
+        let one_more = heads
+            .iter()
+            .filter(|&&h| h.len() == rest.len() + 1 && h[0] == b'G' && &h[1..] == rest)
+            .count();
+        if here <= one_more {
+            break;
+        }
+        trim += 1;
+    }
+    trim
+}
+
+/// A read's position at candidate boundary `ci`, if its collinear hits hold it.
+fn read_pos_at(hits: &[(u32, u32)], ci: usize) -> Option<u32> {
+    hits.binary_search_by_key(&(ci as u32), |&(c, _)| c).ok().map(|i| hits[i].1)
 }
 
 const NO_CANDIDATE: u32 = u32::MAX;
@@ -299,6 +396,10 @@ mod tests {
     }
 
     fn consensus_of(seqs: &[Vec<u8>]) -> Vec<u8> {
+        consensus_with(seqs, ConsensusEnds::default())
+    }
+
+    fn consensus_with(seqs: &[Vec<u8>], ends: ConsensusEnds) -> Vec<u8> {
         let reads: Vec<Read> = seqs
             .iter()
             .enumerate()
@@ -307,7 +408,52 @@ mod tests {
         let read_maps: Vec<MinimizerMap> =
             reads.iter().map(|r| minimizer_map(&r.seq, 15, 10)).collect();
         let members: Vec<usize> = (0..reads.len()).collect();
-        build_consensus(&reads, &members, &members, &read_maps)
+        build_consensus(&reads, &members, &members, &read_maps, ends)
+    }
+
+    fn with_g(n: usize, seq: &[u8]) -> Vec<u8> {
+        let mut s = vec![b'G'; n];
+        s.extend_from_slice(seq);
+        s
+    }
+
+    const TRIM: ConsensusEnds = ConsensusEnds { trim_cap_g: true, vote_tail: false };
+
+    #[test]
+    fn trims_the_untemplated_gs_of_a_capped_start() {
+        // The backbone carries two untemplated Gs, four reads one, two none; four reads are
+        // 5'-truncated. The transcript starts with A.
+        let mut truth = random_seq(900, 31);
+        truth[0] = b'A';
+        let mut seqs = vec![with_g(2, &truth)];
+        seqs.extend((0..4).map(|_| with_g(1, &truth)));
+        seqs.extend((0..2).map(|_| truth.clone()));
+        seqs.extend((0..4).map(|i| truth[300 + 40 * i..].to_vec()));
+        assert_eq!(consensus_of(&seqs), with_g(2, &truth), "kept without trimming");
+        assert_eq!(consensus_with(&seqs, TRIM), truth);
+    }
+
+    #[test]
+    fn keeps_the_g_a_transcript_starts_with() {
+        // The transcript starts with G: four capped reads carry one more G before it, two
+        // uncapped reads start at it. Only the added G goes.
+        let mut truth = random_seq(900, 37);
+        truth[0] = b'G';
+        truth[1] = b'C';
+        let mut seqs: Vec<Vec<u8>> = (0..4).map(|_| with_g(1, &truth)).collect();
+        seqs.extend((0..2).map(|_| truth.clone()));
+        assert_eq!(consensus_with(&seqs, TRIM), truth);
+    }
+
+    #[test]
+    fn the_tail_vote_ends_at_the_most_common_read_end() {
+        // The backbone and one more read end at 1000, five reads at 980.
+        let truth = random_seq(1000, 41);
+        let mut seqs = vec![truth.clone(), truth[50..].to_vec()];
+        seqs.extend([10, 20, 30, 40, 60].map(|start| truth[start..980].to_vec()));
+        assert_eq!(consensus_of(&seqs), truth, "the backbone's end without the vote");
+        let vote = ConsensusEnds { trim_cap_g: false, vote_tail: true };
+        assert_eq!(consensus_with(&seqs, vote), truth[..980].to_vec());
     }
 
     #[test]
@@ -354,8 +500,9 @@ mod tests {
             reads.iter().map(|r| minimizer_map(&r.seq, 15, 10)).collect();
         let members = [0, 1];
         let group_reads = [0, 1, 2, 3, 4];
-        assert_ne!(build_consensus(&reads, &members, &members, &read_maps), truth);
-        assert_eq!(build_consensus(&reads, &members, &group_reads, &read_maps), truth);
+        let ends = ConsensusEnds::default();
+        assert_ne!(build_consensus(&reads, &members, &members, &read_maps, ends), truth);
+        assert_eq!(build_consensus(&reads, &members, &group_reads, &read_maps, ends), truth);
     }
 
     #[test]

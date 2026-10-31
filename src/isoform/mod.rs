@@ -42,7 +42,7 @@ use anchors::MinimizerMap;
 pub use find_isoforms::{parse_args, run, print_usage, Config};
 pub use options::{AltStarts, CapSignal, EndMerge, IsoformOptions, StartLibrary, StartSplit};
 pub(crate) use options::{apply_isoform_flag, ISOFORM_HELP};
-pub(crate) use output::{format_cluster_records, OutputFiles, ClusterRecords};
+pub(crate) use output::{count_isoforms, format_cluster_records, OutputFiles, ClusterRecords};
 
 pub struct Read {
     pub name: String,
@@ -58,6 +58,9 @@ pub(crate) struct Isoform {
     /// Starts at a downstream transcription start that `--start-split auto` validated, so
     /// collapse must not fold it into a longer isoform that differs only at the 5' end.
     pub alt_start: bool,
+    /// A start variant (`--start-variants report`): the index of the isoform it varies in the
+    /// cluster's list, and its start relative to that isoform's (bp, + = downstream).
+    pub variant_of: Option<(usize, i32)>,
 }
 
 /// A read placed on its group's backbone: (read_idx, start, end), with start and end in
@@ -131,6 +134,7 @@ fn isoforms_from_groups(
     stats::add_elapsed(&stats::T_PARTITION, lap_start);
 
     let lap_start = Instant::now();
+    let ends = options.consensus_ends();
     let isoforms: Vec<Isoform> = drafts
         .into_iter()
         .map(|(members, alt_start, group_index)| {
@@ -139,8 +143,9 @@ fn isoforms_from_groups(
                 &members,
                 &reads_by_group[group_index],
                 read_maps,
+                ends,
             );
-            Isoform { members, consensus, alt_start }
+            Isoform { members, consensus, alt_start, variant_of: None }
         })
         .collect();
     stats::add_elapsed(&stats::T_CONS, lap_start);
@@ -210,4 +215,38 @@ fn group_by_structure(
         remaining = rest;
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed pseudo-random sequence.
+    fn random_seq(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                b"ACGT"[(x >> 33) as usize % 4]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_gap_jump_rejects_without_aligning_what_the_alignment_rejects() {
+        // A read missing a 150 bp exon of its backbone: one gap with a 150 bp length difference.
+        let gene = random_seq(2000, 3);
+        let skipped: Vec<u8> = gene[..900].iter().chain(&gene[1050..]).copied().collect();
+        let mut options = IsoformOptions::default();
+        let map = |s: &[u8]| anchors::minimizer_map(s, options.minimizer_k, options.minimizer_w);
+        let (gene_map, skipped_map) = (map(&gene), map(&skipped));
+        let fits = |options: &IsoformOptions, read: &[u8], read_map: &MinimizerMap| {
+            fit::place_on_backbone(read_map, &gene_map, read, &gene, options).is_some()
+        };
+        options.max_gap_jump = 0;
+        assert!(!fits(&options, &skipped, &skipped_map), "the alignment rejects the skipped exon");
+        options.max_gap_jump = 20;
+        assert!(!fits(&options, &skipped, &skipped_map), "so does the length difference");
+        assert!(fits(&options, &gene, &gene_map), "the same structure still fits");
+    }
 }

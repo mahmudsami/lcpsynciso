@@ -51,6 +51,11 @@ cluster identically by default (`--min-shared` 3, `--min-shared-frac` 0.1).
 | `isoform_assignments.tsv` | read_name, cluster_id, isoform_id (with a header row) |
 | `isoform_summary.tsv` | cluster_id, isoform_id, n_reads, length (with a header row) |
 | `isoforms.fasta` | consensus sequence per isoform |
+| `start_variants.fasta` | consensus per start variant: an isoform's other start in the same promoter (header: `variant_of=`, `start_offset=`) |
+| `start_variant_assignments.tsv` | read_name, cluster_id, variant_id, isoform_id (with a header row) |
+
+A start variant's reads count for its isoform in the first three files, so they describe the
+isoforms alone. `--start-variants keep` reports start variants as isoforms instead.
 
 Not every read is assigned. A read is left out of `isoform_assignments.tsv` if its group
 has fewer than `--min-iso` reads, if it fits no isoform's ends, or if its cluster is
@@ -107,7 +112,13 @@ order needs it, because the longest reads start clusters first.
    of the reads covering that position (at least 2); each window takes the most frequent
    read substring. Where fewer than 3 of the isoform's own reads cover a position, the other
    reads of its structure group (same exons, other ends) vote too. No multiple alignment is
-   needed.
+   needed. The 5' end is the longest read's; in a library with a cap signal, its leading Gs
+   are trimmed while more reads start at the G than carry one more G before it, since
+   template switching adds one untemplated G at most capped ends (`--cap-g`). The 3' end is
+   the longest read's. `--consensus-tail vote` takes instead the most frequent read tail from
+   the last window boundary most reads hold: on UHRR HiFi it ends exactly at the annotated end
+   more often (67% vs 56% of full-length matches), but recovers about 1% fewer transcripts
+   full-length and 4% fewer at 99.9% coverage.
 4. **Merge duplicates:** isoforms whose consensuses show they are the same transcript. When
    the merged isoform is the more complete one (it reaches further 5', or on to the 3' end
    past reads that stop early), the kept isoform's consensus is rebuilt from all its reads.
@@ -115,7 +126,10 @@ order needs it, because the longest reads start clusters first.
    (`--alt-starts keep`, the default; `merge` lets it merge like any other). Isoforms that
    differ only at the 3' end merge when the smaller has at most `--collapse-ratio` of the
    larger's reads; with `--end-merge polya` they merge instead only if the longer isoform
-   is A-rich just past the earlier end (internal priming), whatever the read counts.
+   is A-rich just past the earlier end (internal priming), whatever the read counts. Two
+   isoforms kept apart that share the structure and 3' end peak, with starts at most
+   `--start-variant-window` bp apart (50; one promoter), are one isoform and a start variant
+   of it: the one with fewer reads is reported in `start_variants.fasta`.
 
 ## Notes
 

@@ -1,6 +1,8 @@
 //! Isoform-detection settings: [`IsoformOptions`], its defaults, and the command-line flags and
 //! help text that `predict` and `find-isoforms` share.
 
+use super::consensus::ConsensusEnds;
+
 /// How read starts split a structure group (`--start-split`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartSplit {
@@ -77,6 +79,11 @@ pub struct IsoformOptions {
     pub min_gap_ident: f64,
     /// An indel of at least this many bp in an aligned gap is extra sequence, not error.
     pub max_indel_run: u32,
+    /// A gap whose read and backbone lengths differ by at least this many bp is rejected
+    /// without aligning it (0: always align). The difference forces that many indel bases;
+    /// on UHRR reads no aligned gap differing by >= 64 bp was accepted (ONT cDNA 47.4M, dRNA
+    /// 14.3M and PacBio HiFi 82.1M such gaps), and 0.1% of those differing by 32-63 bp.
+    pub max_gap_jump: u32,
     /// Unmatched flank (bp) that means a different structure: at one end if the sequences
     /// diverge there, at both ends if the read merely overhangs the backbone.
     pub max_flank: u32,
@@ -101,9 +108,15 @@ pub struct IsoformOptions {
     /// The library's cap signal and thresholds, once known; None decides per structure group.
     pub start_library: Option<StartLibrary>,
 
-    // Step 3: isoforms.
+    // Step 3: isoforms and their consensus. (`consensus.rs`)
     /// Minimum reads for an isoform, and for an end peak.
     pub min_iso: usize,
+    /// Trim from a consensus the leading Gs that template switching added in front of a capped
+    /// start, in a library with the cap signal (`--cap-g`).
+    pub trim_cap_g: bool,
+    /// Take a consensus's 3' end from the most frequent read tail rather than from the longest
+    /// read (`--consensus-tail`).
+    pub vote_tail: bool,
 
     // Step 4: merge duplicates. (`collapse.rs`)
     /// Largest gap, indel or length difference (bp) between two isoforms that still merge.
@@ -121,6 +134,11 @@ pub struct IsoformOptions {
     pub priming_window: usize,
     /// With `EndMerge::Polya`: A fraction of that window that means internal priming.
     pub priming_a_frac: f64,
+    /// Report an isoform kept apart that has another's structure and 3' end and a start at
+    /// most `start_variant_window` bp away (one promoter) as a start variant of it, apart from
+    /// the isoforms (`--start-variants`).
+    pub start_variants: bool,
+    pub start_variant_window: u32,
 }
 
 impl Default for IsoformOptions {
@@ -130,9 +148,10 @@ impl Default for IsoformOptions {
             minimizer_w: 10,
             min_anchors: 3,
             min_cov: 0.80,
-            max_gap: 40,
+            max_gap: 10,
             min_gap_ident: 0.80,
             max_indel_run: 4,
+            max_gap_jump: 64,
             max_flank: 25,
             start_split: StartSplit::Auto,
             peak_width: 10,
@@ -142,6 +161,8 @@ impl Default for IsoformOptions {
             stop_threshold: None,
             start_library: None,
             min_iso: 3,
+            trim_cap_g: true,
+            vote_tail: false,
             collapse_gap: 3,
             collapse_ratio: 0.5,
             collapse_ident: 0.98,
@@ -149,7 +170,22 @@ impl Default for IsoformOptions {
             end_merge: EndMerge::Ratio,
             priming_window: 20,
             priming_a_frac: 0.6,
+            start_variants: true,
+            start_variant_window: 50,
         }
+    }
+}
+
+impl IsoformOptions {
+    /// How a consensus treats its ends. Leading Gs are trimmed only where the library is known
+    /// to show the cap signal: `predict` decides it before step 2, `find-isoforms` only with
+    /// `--cap-signal on`.
+    pub(crate) fn consensus_ends(&self) -> ConsensusEnds {
+        let cap_signal = match self.start_library {
+            Some(library) => library.cap_signal,
+            None => self.cap_signal == CapSignal::On,
+        };
+        ConsensusEnds { trim_cap_g: self.trim_cap_g && cap_signal, vote_tail: self.vote_tail }
     }
 }
 
@@ -167,6 +203,7 @@ pub(crate) fn apply_isoform_flag(
         "--max-gap" => options.max_gap = next().parse().unwrap(),
         "--min-gap-ident" => options.min_gap_ident = next().parse().unwrap(),
         "--max-indel-run" => options.max_indel_run = next().parse().unwrap(),
+        "--max-gap-jump" => options.max_gap_jump = next().parse().unwrap(),
         "--max-flank" => options.max_flank = next().parse().unwrap(),
         "--start-split" => {
             options.start_split = match next().as_str() {
@@ -207,6 +244,26 @@ pub(crate) fn apply_isoform_flag(
             }
         }
         "--min-iso" => options.min_iso = next().parse().unwrap(),
+        "--cap-g" => {
+            options.trim_cap_g = match next().as_str() {
+                "trim" => true,
+                "keep" => false,
+                other => {
+                    eprintln!("--cap-g takes trim or keep, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--consensus-tail" => {
+            options.vote_tail = match next().as_str() {
+                "vote" => true,
+                "backbone" => false,
+                other => {
+                    eprintln!("--consensus-tail takes vote or backbone, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
         "--collapse-gap" => options.collapse_gap = next().parse().unwrap(),
         "--collapse-ratio" => options.collapse_ratio = next().parse().unwrap(),
         "--collapse-ident" => options.collapse_ident = next().parse().unwrap(),
@@ -232,6 +289,17 @@ pub(crate) fn apply_isoform_flag(
         }
         "--priming-window" => options.priming_window = next().parse().unwrap(),
         "--priming-a-frac" => options.priming_a_frac = next().parse().unwrap(),
+        "--start-variants" => {
+            options.start_variants = match next().as_str() {
+                "report" => true,
+                "keep" => false,
+                other => {
+                    eprintln!("--start-variants takes report or keep, not {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "--start-variant-window" => options.start_variant_window = next().parse().unwrap(),
         _ => return false,
     }
     true
@@ -243,12 +311,14 @@ STRUCTURE (each read is tested against the longest unassigned read of its cluste
     --min-iso N             min reads for a reported isoform             [3]
     --min-anchors N         min collinear anchors to trust an alignment  [3]
     --min-cov F             read fraction its alignment must cover       [0.80]
-    --max-gap N             gap between anchors (bp) above which it is   [40]
+    --max-gap N             gap between anchors (bp) above which it is   [10]
                             aligned; shorter ones count as sequencing error
     --min-gap-ident F       min identity Eq/(Eq+X) of an aligned gap,    [0.80]
                             indel columns excluded
     --max-indel-run N       one indel of >= N bp in an aligned gap is    [4]
                             extra sequence, not error
+    --max-gap-jump N        reject a gap whose read and backbone lengths [64]
+                            differ by >= N bp without aligning it (0: off)
     --max-flank N           unmatched read end (bp) meaning a different  [25]
                             structure: one end if the sequences diverge there,
                             both ends if the read only overhangs the longest read
@@ -283,6 +353,17 @@ READ ENDS (a structure group splits into isoforms by where its reads start and e
                             plus the reads running past it); auto: the Otsu cut
                             over the library's start peaks (predict)
 
+CONSENSUS (per isoform: the longest read, corrected window by window by the reads):
+    --cap-g trim|keep       leading Gs that template switching added in  [trim]
+                            front of a capped start: trim them while more
+                            reads start at the G than carry one more G before
+                            it (only with a cap signal); keep = the longest read's
+    --consensus-tail backbone|vote
+                            3' end: backbone = the longest read's;   [backbone]
+                            vote = the most frequent read tail from the
+                            last window boundary most reads hold (more
+                            exact 3' ends, fewer full-length recoveries)
+
 MERGING (near-identical isoforms, after consensus):
     --collapse-gap N        max gap or length difference (bp) to merge   [3]
     --collapse-ratio F      merge only if the smaller has <= F x the     [0.5]
@@ -298,4 +379,14 @@ MERGING (near-identical isoforms, after consensus):
                             longer isoform is A-rich just past it (internal
                             priming), else keep both
     --priming-window N      bases past the earlier end tested (polya)    [20]
-    --priming-a-frac F      A fraction there meaning internal priming    [0.6]";
+    --priming-a-frac F      A fraction there meaning internal priming    [0.6]
+    --start-variants report|keep
+                            isoforms kept apart that share structure     [report]
+                            and 3' end peak and start within
+                            --start-variant-window bp (one promoter): report =
+                            the smaller is a start variant of the larger, written
+                            to start_variants.fasta, its reads counted for the
+                            larger; keep = both stay isoforms
+    --start-variant-window N
+                            max bp between the starts of a start variant [50]
+                            and its isoform";

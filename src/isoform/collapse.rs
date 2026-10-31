@@ -27,16 +27,24 @@
 //!     end is either a real polyA site or the oligo-dT primer annealed to an A-rich stretch;
 //!     the longer isoform holds the sequence just past that end, so an A-rich window there
 //!     merges the pair and anything else keeps both.
+//!
+//! A pair kept apart that has the same structure and the same 3' end (within `peak_width`),
+//! with starts at most `start_variant_window` bp apart, starts in one promoter. With
+//! `--start-variants report` (the default) the smaller is a start variant of the larger: it is
+//! reported apart from the isoforms, its reads count for the larger. On UHRR HiFi the larger of
+//! such pairs started at a dominant CAGE initiation site of its refTSS peak, and the smaller
+//! barely above chance, so the starts spread over one promoter rather than marking two.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::anchors::{minimizer_map, MinimizerMap};
 use super::fit::{place_on_backbone, strip_homopolymer_ends};
-use super::{align, consensus, AltStarts, EndMerge, Isoform, IsoformOptions, Read};
+use super::{align, consensus, stats, AltStarts, EndMerge, Isoform, IsoformOptions, Read};
 
 /// Merge duplicate isoforms among `isoforms`, whose members index `reads` (with minimizer maps
-/// `read_maps`, used to rebuild a consensus).
+/// `read_maps`, used to rebuild a consensus). The kept isoforms come first, then the start
+/// variants, each with the index of its isoform in the returned list.
 pub(super) fn merge_duplicates(
     mut isoforms: Vec<Isoform>,
     reads: &[Read],
@@ -60,10 +68,12 @@ pub(super) fn merge_duplicates(
 
     let n = isoforms.len();
     let mut merged_into: Vec<Option<usize>> = vec![None; n]; // merged isoform -> kept isoform
+    // Start variant -> (the isoform it varies, its start relative to that one's). A variant is
+    // still kept, so later isoforms merge into it as they would without variants.
+    let mut variant_of: Vec<Option<(usize, i32)>> = vec![None; n];
     let mut rebuild = vec![false; n]; // kept isoform absorbed a more complete copy of itself
     let mut kept: Vec<usize> = Vec::new();
     for i in 0..n {
-        let mut into = None;
         for &j in &kept {
             match decide_merge(
                 &isoforms[i],
@@ -77,24 +87,48 @@ pub(super) fn merge_duplicates(
                 MergeDecision::Merge => {}
                 MergeDecision::MergeAndRebuild => rebuild[j] = true,
             }
-            into = Some(j);
+            merged_into[i] = Some(j);
             break;
         }
-        match into {
-            Some(j) => merged_into[i] = Some(j),
-            None => kept.push(i),
+        if merged_into[i].is_some() {
+            continue;
         }
+        if options.start_variants {
+            // The first larger isoform it is a start variant of; a variant of a variant varies
+            // that variant's isoform.
+            let found = kept.iter().find_map(|&j| {
+                let (i_map, j_map) = (&consensus_maps[i], &consensus_maps[j]);
+                start_variant(&isoforms[i], &isoforms[j], i_map, j_map, options, &strict).map(
+                    |start| match variant_of[j] {
+                        Some((root, offset)) => (root, offset + start),
+                        None => (j, start),
+                    },
+                )
+            });
+            variant_of[i] = found;
+        }
+        kept.push(i);
     }
 
-    // Kept isoforms in visiting order, each absorbing the reads merged into it.
-    let mut pos: HashMap<usize, usize> = HashMap::new();
-    let mut kept_isoforms: Vec<Isoform> = Vec::with_capacity(kept.len());
-    for (p, &kept_idx) in kept.iter().enumerate() {
-        pos.insert(kept_idx, p);
+    // Kept isoforms in visiting order, then the start variants, each absorbing the reads
+    // merged into it.
+    let order: Vec<usize> = kept
+        .iter()
+        .copied()
+        .filter(|&k| variant_of[k].is_none())
+        .chain(kept.iter().copied().filter(|&k| variant_of[k].is_some()))
+        .collect();
+    let pos: HashMap<usize, usize> = order.iter().enumerate().map(|(p, &k)| (k, p)).collect();
+    let mut kept_isoforms: Vec<Isoform> = Vec::with_capacity(order.len());
+    for &k in &order {
+        if variant_of[k].is_some() {
+            stats::inc(&stats::N_START_VARIANTS);
+        }
         kept_isoforms.push(Isoform {
-            members: std::mem::take(&mut isoforms[kept_idx].members),
-            consensus: std::mem::take(&mut isoforms[kept_idx].consensus),
-            alt_start: isoforms[kept_idx].alt_start,
+            members: std::mem::take(&mut isoforms[k].members),
+            consensus: std::mem::take(&mut isoforms[k].consensus),
+            alt_start: isoforms[k].alt_start,
+            variant_of: variant_of[k].map(|(root, start)| (pos[&root], start)),
         });
     }
     for i in 0..n {
@@ -103,14 +137,52 @@ pub(super) fn merge_duplicates(
             kept_isoforms[pos[&j]].members.extend(extra);
         }
     }
-    for (p, &kept_idx) in kept.iter().enumerate() {
-        if rebuild[kept_idx] {
-            let isoform = &mut kept_isoforms[p];
-            isoform.consensus =
-                consensus::build_consensus(reads, &isoform.members, &isoform.members, read_maps);
+    // A rebuild keeps the longest read's 3' end: it may be the real end that most of the
+    // merged reads stop short of.
+    let ends = consensus::ConsensusEnds { vote_tail: false, ..options.consensus_ends() };
+    for &k in &order {
+        if rebuild[k] {
+            let isoform = &mut kept_isoforms[pos[&k]];
+            isoform.consensus = consensus::build_consensus(
+                reads,
+                &isoform.members,
+                &isoform.members,
+                read_maps,
+                ends,
+            );
         }
     }
     kept_isoforms
+}
+
+/// Whether `small`, kept apart from the larger `big`, is a start variant of it: the same
+/// structure and the same 3' end (within `peak_width`, one end peak), with a start at most
+/// `start_variant_window` bp away. Returns the start relative to `big`'s (+ = downstream).
+fn start_variant(
+    small: &Isoform,
+    big: &Isoform,
+    small_map: &MinimizerMap,
+    big_map: &MinimizerMap,
+    options: &IsoformOptions,
+    strict: &IsoformOptions,
+) -> Option<i32> {
+    let window = options.start_variant_window as i32;
+    let end_slack = options.peak_width as i32;
+    let (small_len, big_len) = (small.consensus.len() as i32, big.consensus.len() as i32);
+    if (small_len - big_len).abs() > window + end_slack {
+        return None;
+    }
+    // The shorter consensus placed on the longer, as in containment.
+    let (start, end, longer_len, sign) = if small_len <= big_len {
+        let (start, end) =
+            place_on_backbone(small_map, big_map, &small.consensus, &big.consensus, strict)?;
+        (start, end, big_len, 1)
+    } else {
+        let (start, end) =
+            place_on_backbone(big_map, small_map, &big.consensus, &small.consensus, strict)?;
+        (start, end, small_len, -1)
+    };
+    (start.abs() <= window && (end - longer_len).abs() <= end_slack).then_some(sign * start)
 }
 
 /// How `small` relates to a larger isoform it may merge into.
@@ -267,11 +339,13 @@ mod tests {
                 members: (0..10).collect(),
                 consensus: truth[500..].to_vec(),
                 alt_start: false,
+                variant_of: None,
             },
             Isoform {
                 members: (10..13).collect(),
                 consensus: truth.clone(),
                 alt_start: false,
+                variant_of: None,
             },
         ];
         let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
@@ -300,11 +374,13 @@ mod tests {
                 members: (0..10).collect(),
                 consensus: truth[500..].to_vec(),
                 alt_start: true,
+                variant_of: None,
             },
             Isoform {
                 members: (10..13).collect(),
                 consensus: truth.clone(),
                 alt_start: false,
+                variant_of: None,
             },
         ];
         assert_eq!(merge_duplicates(isoforms, &reads, &read_maps, &options).len(), 2);
@@ -332,11 +408,13 @@ mod tests {
                 members: (0..10).collect(),
                 consensus: truth[..900].to_vec(),
                 alt_start: false,
+                variant_of: None,
             },
             Isoform {
                 members: (10..13).collect(),
                 consensus: truth.clone(),
                 alt_start: false,
+                variant_of: None,
             },
         ];
         let out = merge_duplicates(isoforms, &reads, &read_maps, &options);
@@ -348,19 +426,53 @@ mod tests {
     /// returns (reads, consensus length) per final isoform, largest first.
     fn merge_case(seqs: &[Vec<u8>], counts: &[usize], alt: &[bool], options: &IsoformOptions)
         -> Vec<(usize, usize)> {
+        merge_full(seqs, counts, alt, options)
+            .iter().map(|iso| (iso.members.len(), iso.consensus.len())).collect()
+    }
+
+    fn merge_full(seqs: &[Vec<u8>], counts: &[usize], alt: &[bool], options: &IsoformOptions)
+        -> Vec<Isoform> {
         let mut all: Vec<Vec<u8>> = Vec::new();
         let mut isoforms = Vec::new();
         for ((seq, &n), &a) in seqs.iter().zip(counts).zip(alt) {
             let first = all.len();
             all.extend((0..n).map(|_| seq.clone()));
-            isoforms.push(Isoform { members: (first..first + n).collect(), consensus: seq.clone(), alt_start: a });
+            isoforms.push(Isoform {
+                members: (first..first + n).collect(),
+                consensus: seq.clone(),
+                alt_start: a,
+                variant_of: None,
+            });
         }
         let reads: Vec<Read> = all.iter().enumerate()
             .map(|(i, seq)| Read { name: i.to_string(), seq: seq.clone() }).collect();
         let read_maps: Vec<MinimizerMap> = reads.iter()
             .map(|r| minimizer_map(&r.seq, options.minimizer_k, options.minimizer_w)).collect();
         merge_duplicates(isoforms, &reads, &read_maps, options)
-            .iter().map(|iso| (iso.members.len(), iso.consensus.len())).collect()
+    }
+
+    #[test]
+    fn a_validated_start_in_the_same_promoter_is_a_start_variant() {
+        // 12 full-length reads and 4 at a validated start 30 bp downstream: one promoter. The
+        // smaller is reported as a start variant of the larger, 30 bp downstream; without
+        // --start-variants report both stay isoforms.
+        let truth = random_seq(1500, 5);
+        let seqs = [truth.clone(), truth[30..].to_vec()];
+        let out = merge_full(&seqs, &[12, 4], &[false, true], &IsoformOptions::default());
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].members.len(), out[0].variant_of), (12, None));
+        assert_eq!((out[1].members.len(), out[1].variant_of), (4, Some((0, 30))));
+        // the same when the smaller starts upstream
+        let seqs = [truth[30..].to_vec(), truth.clone()];
+        let out = merge_full(&seqs, &[12, 4], &[true, false], &IsoformOptions::default());
+        assert_eq!(out[1].variant_of, Some((0, -30)));
+        let keep = IsoformOptions { start_variants: false, ..IsoformOptions::default() };
+        let out = merge_full(&seqs, &[12, 4], &[true, false], &keep);
+        assert!(out.iter().all(|iso| iso.variant_of.is_none()));
+        // a validated start 500 bp downstream is a transcript of its own
+        let seqs = [truth.clone(), truth[500..].to_vec()];
+        let out = merge_full(&seqs, &[12, 4], &[false, true], &IsoformOptions::default());
+        assert!(out.iter().all(|iso| iso.variant_of.is_none()));
     }
 
     #[test]
